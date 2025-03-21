@@ -39,8 +39,13 @@ pub mod term;
 
 pub mod wait;
 
-#[cfg(not(any(target_os = "freebsd", target_os = "linux", target_os = "netbsd")))]
-compile_error!("sudo-rs only works on Linux, FreeBSD, NetBSD");
+#[cfg(not(any(
+    target_os = "freebsd",
+    target_os = "linux",
+    target_os = "netbsd",
+    target_os = "macos"
+)))]
+compile_error!("sudo-rs only works on Linux, FreeBSD, NetBSD, MacOS");
 
 pub(crate) fn _exit(status: c_int) -> ! {
     // SAFETY: this function is safe to call
@@ -407,8 +412,8 @@ impl User {
                 let result = unsafe {
                     libc::getgrouplist(
                         pwd.pw_name,
-                        pwd.pw_gid,
-                        groups_buffer.as_mut_ptr(),
+                        pwd.pw_gid as _,
+                        groups_buffer.as_mut_ptr() as _,
                         &mut buf_len,
                     )
                 };
