@@ -138,8 +138,7 @@ pub fn dynamic_fill<T: Default + Copy, E>(
 
 #[cfg(target_os = "macos")]
 /// # Safety
-///
-/// The same as libc::pipe
+/// Same as `libc::pipe`.
 pub unsafe extern "C" fn pipe2(fds: *mut c_int, flags: c_int) -> c_int {
     // SAFETY: the caller has to ensure this call is safe
     unsafe {
