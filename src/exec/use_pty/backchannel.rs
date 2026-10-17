@@ -52,6 +52,7 @@ impl BackchannelPair {
 }
 
 pub(super) enum ParentMessage {
+    CommandStarted,
     IoError(c_int),
     CommandStatus(CommandStatus),
     CommandPid(ProcessId),
@@ -66,9 +67,11 @@ impl ParentMessage {
     const CMD_STAT_STOP: Prefix = 3;
     const CMD_PID: Prefix = 4;
     const SHORT_READ: Prefix = 5;
+    const CMD_STARTED: Prefix = 6;
 
     fn from_parts(prefix: Prefix, data: ParentData) -> Self {
         match prefix {
+            Self::CMD_STARTED => Self::CommandStarted,
             Self::IO_ERROR => Self::IoError(data),
             Self::CMD_STAT_EXIT => Self::CommandStatus(CommandStatus::Exit(data)),
             Self::CMD_STAT_TERM => Self::CommandStatus(CommandStatus::Term(data)),
@@ -81,6 +84,7 @@ impl ParentMessage {
 
     fn to_parts(&self) -> (Prefix, ParentData) {
         let prefix = match self {
+            ParentMessage::CommandStarted => Self::CMD_STARTED,
             ParentMessage::IoError(_) => Self::IO_ERROR,
             ParentMessage::CommandStatus(CommandStatus::Exit(_)) => Self::CMD_STAT_EXIT,
             ParentMessage::CommandStatus(CommandStatus::Term(_)) => Self::CMD_STAT_TERM,
@@ -90,6 +94,7 @@ impl ParentMessage {
         };
 
         let data = match self {
+            ParentMessage::CommandStarted => 0,
             ParentMessage::IoError(data) => *data,
             ParentMessage::CommandPid(data) => data.inner(),
             ParentMessage::CommandStatus(status) => match status {

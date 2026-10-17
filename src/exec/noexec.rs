@@ -194,7 +194,7 @@ union SingleRightAnciliaryData {
 }
 
 /// Receives a raw file descriptor from the provided UnixStream
-fn receive_fd(rx_fd: UnixStream) -> OwnedFd {
+fn receive_fd(rx_fd: UnixStream) -> io::Result<Option<OwnedFd>> {
     let mut data = [0u8; 1];
     let mut iov = iovec {
         iov_base: &mut data as *mut [u8; 1] as *mut c_void,
@@ -215,12 +215,21 @@ fn receive_fd(rx_fd: UnixStream) -> OwnedFd {
     msg.msg_control = &mut control as *mut _ as *mut c_void;
 
     // SAFETY: A valid socket fd and a valid initialized msghdr are passed in.
-    if unsafe { recvmsg(rx_fd.as_raw_fd(), &mut msg, 0) } == -1 {
-        panic!("failed to recvmsg: {}", io::Error::last_os_error());
+    let received = super::io_util::retry_while_interrupted(|| {
+        // SAFETY: The message buffers above are valid for recvmsg.
+        crate::cutils::cerr(unsafe { recvmsg(rx_fd.as_raw_fd(), &mut msg, 0) })
+    })?;
+    if received == 0 {
+        // The command failed before it could install the filter and send its fd.
+        // Its exec-error pipe reports the actual error to the supervisor.
+        return Ok(None);
     }
 
     if msg.msg_flags & MSG_TRUNC == MSG_TRUNC {
-        unreachable!("unexpected internal error in seccomp filter");
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "truncated seccomp listener message",
+        ));
     }
 
     // SAFETY: The kernel correctly initializes everything on recvmsg for this to be safe.
@@ -231,9 +240,14 @@ fn receive_fd(rx_fd: UnixStream) -> OwnedFd {
             || (*cmsgp).cmsg_level != SOL_SOCKET
             || (*cmsgp).cmsg_type != SCM_RIGHTS
         {
-            unreachable!("unexpected response from Linux kernel");
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "missing seccomp listener descriptor",
+            ));
         }
-        OwnedFd::from_raw_fd(CMSG_DATA(cmsgp).cast::<c_int>().read())
+        Ok(Some(OwnedFd::from_raw_fd(
+            CMSG_DATA(cmsgp).cast::<c_int>().read(),
+        )))
     }
 }
 
@@ -279,7 +293,14 @@ pub(crate) struct SpawnNoexecHandler(UnixStream);
 impl SpawnNoexecHandler {
     pub(super) fn spawn(self) {
         thread::spawn(move || {
-            let notify_fd = receive_fd(self.0);
+            let notify_fd = match receive_fd(self.0) {
+                Ok(Some(fd)) => fd,
+                Ok(None) => return,
+                Err(err) => {
+                    crate::log::dev_warn!("cannot receive seccomp listener: {err}");
+                    return;
+                }
+            };
             // SAFETY: notify_fd is a valid seccomp_unotify fd.
             unsafe { handle_notifications(notify_fd) };
         });

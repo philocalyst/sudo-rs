@@ -1,3 +1,4 @@
+mod background;
 mod event;
 mod io_util;
 mod no_pty;
@@ -24,9 +25,9 @@ use crate::{
     exec::no_pty::exec_no_pty,
     log::{dev_info, dev_warn, user_error},
     system::{
-        _exit, ForkResult, Group, User, fork,
+        _exit, Group, User,
         interface::ProcessId,
-        kill, killpg, mark_fds_as_cloexec, set_target_user, setpgid,
+        kill, killpg, mark_fds_as_cloexec, set_target_user,
         signal::{SignalNumber, SignalSet, SignalsState, consts::*, exit_with_signal, signal_name},
         term::UserTerm,
         wait::{Wait, WaitError, WaitOptions},
@@ -34,6 +35,7 @@ use crate::{
 };
 
 use self::{
+    background::BackgroundStatus,
     event::{EventRegistry, Process},
     io_util::was_interrupted,
     use_pty::{SIGCONT_BG, SIGCONT_FG, exec_pty},
@@ -92,18 +94,7 @@ pub fn run_command(
             "NOEXEC is currently only supported on Linux",
         ));
     }
-    if options.background {
-        // SAFETY: There should be no other threads at this point.
-        match unsafe { fork() }? {
-            ForkResult::Parent(_) => process::exit(0),
-            ForkResult::Child => {
-                // Child continues in an orphaned process group.
-                // Reads from the terminal fail with EIO.
-                // Writes succeed unless tostop is set on the terminal.
-                setpgid(ProcessId::new(0), ProcessId::new(0))?;
-            }
-        }
-    }
+    let background_status = BackgroundStatus::start(options.background)?;
 
     // FIXME: should we pipe the stdio streams?
     let qualified_path = options.command;
@@ -204,14 +195,15 @@ pub fn run_command(
                 user_tty,
                 options.user,
                 options.background,
+                background_status,
             ),
             Err(err) => {
                 dev_info!("Could not open user's terminal, not allocating a pty: {err}");
-                exec_no_pty(sudo_pid, spawn_noexec_handler, command)
+                exec_no_pty(sudo_pid, spawn_noexec_handler, command, background_status)
             }
         }
     } else {
-        exec_no_pty(sudo_pid, spawn_noexec_handler, command)
+        exec_no_pty(sudo_pid, spawn_noexec_handler, command, background_status)
     }
 }
 

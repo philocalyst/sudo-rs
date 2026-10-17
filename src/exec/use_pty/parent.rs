@@ -9,6 +9,7 @@ use crate::exec::use_pty::SIGCONT_FG;
 use crate::exec::use_pty::monitor::exec_monitor;
 use crate::exec::{
     ExitReason, SpawnNoexecHandler,
+    background::BackgroundStatus,
     io_util::retry_while_interrupted,
     use_pty::backchannel::{BackchannelPair, MonitorMessage, ParentBackchannel, ParentMessage},
 };
@@ -33,6 +34,7 @@ pub(in crate::exec) fn exec_pty(
     user_tty: UserTerm,
     pty_owner: &User,
     background: bool,
+    background_status: BackgroundStatus,
 ) -> io::Result<ExitReason> {
     // Allocate a pseudoterminal.
     let pty = get_pty(pty_owner)?;
@@ -209,6 +211,8 @@ pub(in crate::exec) fn exec_pty(
         err
     })?
     else {
+        // Only the supervisor receiving the monitor's launch acknowledgement reports it.
+        background_status.disarm();
         // Close the file descriptors that we don't access
         drop(tty_pipe);
         drop(backchannels.parent);
@@ -244,6 +248,7 @@ pub(in crate::exec) fn exec_pty(
         _exit(1);
     };
 
+    drop(command);
     if let Some(spawner) = spawn_noexec_handler {
         spawner.spawn();
     }
@@ -270,6 +275,7 @@ pub(in crate::exec) fn exec_pty(
         preserve_oflag,
         &mut registry,
         original_signals,
+        background_status,
     )?;
 
     // Restore the signal mask now that the handlers have been setup.
@@ -325,6 +331,7 @@ fn get_pty(pty_owner: &User) -> io::Result<Pty> {
 }
 
 struct ParentClosure {
+    background_status: BackgroundStatus,
     // The monitor PID.
     //
     /// This is `Some` iff the process is still running.
@@ -364,6 +371,7 @@ impl ParentClosure {
         preserve_oflag: bool,
         registry: &mut EventRegistry<Self>,
         mut original_signals: SignalsState,
+        background_status: BackgroundStatus,
     ) -> io::Result<Self> {
         // Enable nonblocking assertions as we will poll this inside the event loop.
         backchannel.set_nonblocking_asserts(true);
@@ -382,6 +390,7 @@ impl ParentClosure {
         let signal_handlers = register_handlers(Self::SIGNALS, &mut original_signals)?;
 
         Ok(Self {
+            background_status,
             monitor_pid: Some(monitor_pid),
             sudo_pid,
             parent_pgrp,
@@ -440,6 +449,11 @@ impl ParentClosure {
             }
             Ok(event) => {
                 match event {
+                    ParentMessage::CommandStarted => {
+                        if let Err(err) = self.background_status.started() {
+                            registry.set_break(err);
+                        }
+                    }
                     // Received the PID of the command. This means that the command is already
                     // executing.
                     ParentMessage::CommandPid(pid) => {
@@ -474,6 +488,7 @@ impl ParentClosure {
                     }
                     ParentMessage::IoError(code) => {
                         let err = io::Error::from_raw_os_error(code);
+                        self.background_status.failed(&err);
                         dev_info!("received error ({code}) for monitor: {err}");
                         registry.set_break(err);
                     }

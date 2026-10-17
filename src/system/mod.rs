@@ -1,14 +1,14 @@
 // TODO: remove unused attribute when system is cleaned up
-#[cfg(target_os = "linux")]
-use std::str::FromStr;
 use std::{
     ffi::{CStr, c_int, c_long, c_uint},
-    fmt, fs, io,
+    fmt, io,
     mem::MaybeUninit,
     ops,
     os::unix,
     path::PathBuf,
 };
+#[cfg(target_os = "linux")]
+use std::{fs, str::FromStr};
 
 use crate::{
     common::{Error, SudoPath, SudoString},
@@ -87,8 +87,8 @@ fn try_close_range(lowfd: c_int) -> io::Result<bool> {
     }
 }
 
-/// Sets CLOEXEC on all fds >= lowfd by walking an fd directory
-/// (/proc/self/fd on Linux, /dev/fd on FreeBSD).
+/// Sets CLOEXEC on all fds >= lowfd by walking Linux's descriptor directory.
+#[cfg(target_os = "linux")]
 fn cloexec_via_fd_dir(lowfd: c_int, path: &str) -> io::Result<()> {
     for entry in fs::read_dir(path)? {
         let file_name = entry?.file_name();
@@ -115,9 +115,87 @@ fn cloexec_via_fd_dir(lowfd: c_int, path: &str) -> io::Result<()> {
 }
 
 #[cfg(target_os = "linux")]
-const FD_DIR: &str = "/proc/self/fd";
-#[cfg(not(target_os = "linux"))]
-const FD_DIR: &str = "/dev/fd";
+fn cloexec_fallback(lowfd: c_int) -> io::Result<()> {
+    cloexec_via_fd_dir(lowfd, "/proc/self/fd")
+}
+
+#[cfg(target_os = "freebsd")]
+fn cloexec_fallback(lowfd: c_int) -> io::Result<()> {
+    // /dev/fd is not a complete descriptor listing unless fdescfs is mounted.
+    // Ask the kernel instead; this also includes sparse descriptors above a
+    // subsequently lowered resource limit.
+    let mib = [
+        libc::CTL_KERN,
+        libc::KERN_PROC,
+        libc::KERN_PROC_FILEDESC,
+        std::process::id() as c_int,
+    ];
+    for _ in 0..3 {
+        let mut len = 0;
+        // SAFETY: mib is valid and len receives the required buffer size.
+        unsafe {
+            cerr(libc::sysctl(
+                mib.as_ptr(),
+                mib.len() as _,
+                std::ptr::null_mut(),
+                &mut len,
+                std::ptr::null(),
+                0,
+            ))?;
+        }
+        let mut buffer = vec![0u8; len];
+        // SAFETY: buffer has len writable bytes; sysctl updates len to the
+        // number of initialized bytes, or fails if the snapshot grew.
+        let result = unsafe {
+            cerr(libc::sysctl(
+                mib.as_ptr(),
+                mib.len() as _,
+                buffer.as_mut_ptr().cast(),
+                &mut len,
+                std::ptr::null(),
+                0,
+            ))
+        };
+        match result {
+            Err(err) if err.raw_os_error() == Some(libc::ENOMEM) => continue,
+            Err(err) => return Err(err),
+            Ok(_) => {}
+        }
+        buffer.truncate(len);
+        let fd_offset = std::mem::offset_of!(libc::kinfo_file, kf_fd);
+        let invalid = || {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "invalid kernel descriptor snapshot",
+            )
+        };
+        let mut remaining = buffer.as_slice();
+        while !remaining.is_empty() {
+            let size = c_int::from_ne_bytes(
+                remaining
+                    .get(..size_of::<c_int>())
+                    .ok_or_else(invalid)?
+                    .try_into()
+                    .map_err(|_| invalid())?,
+            );
+            let size = usize::try_from(size).map_err(|_| invalid())?;
+            if size < fd_offset + size_of::<c_int>() || size > remaining.len() {
+                return Err(invalid());
+            }
+            let fd = c_int::from_ne_bytes(
+                remaining[fd_offset..fd_offset + size_of::<c_int>()]
+                    .try_into()
+                    .map_err(|_| invalid())?,
+            );
+            if fd >= lowfd {
+                set_cloexec(fd)?;
+            }
+            remaining = &remaining[size..];
+        }
+        return Ok(());
+    }
+    Err(io::Error::other("kernel descriptor snapshot kept changing"))
+}
 
 /// Mark every file descriptor that is not one of the IO streams as CLOEXEC.
 pub(crate) fn mark_fds_as_cloexec() -> io::Result<()> {
@@ -128,8 +206,8 @@ pub(crate) fn mark_fds_as_cloexec() -> io::Result<()> {
     }
 
     // The kernel doesn't support close_range or CLOSE_RANGE_CLOEXEC,
-    // so fall back to enumerating the platform's fd directory.
-    cloexec_via_fd_dir(lowfd, FD_DIR)
+    // so fall back to a complete platform descriptor snapshot.
+    cloexec_fallback(lowfd)
 }
 
 pub(crate) enum ForkResult {
@@ -797,7 +875,7 @@ impl Process {
                 }
                 Err(e) if e.raw_os_error() == Some(libc::ENOMEM) => {
                     // Vector not big enough. Grow it by 10% and try again.
-                    ki_proc.reserve(ki_proc.capacity() + (ki_proc.capacity() + 9) / 10);
+                    ki_proc.reserve(ki_proc.capacity() + ki_proc.capacity().div_ceil(10));
                 }
                 Err(e) => return Err(e),
             }
@@ -1139,9 +1217,17 @@ mod tests {
                 let fd =
                     crate::cutils::cerr(libc::fcntl(file.as_raw_fd(), libc::F_DUPFD, 128)).unwrap();
                 let open_in_child = |expected: bool| {
-                    let op = if expected { "-e" } else { "! -e" };
-                    std::process::Command::new("/bin/sh")
-                        .args(["-c", &format!("test {op} /dev/fd/{fd}")])
+                    std::process::Command::new(std::env::current_exe().unwrap())
+                        .args([
+                            "--exact",
+                            "system::tests::descriptor_state_after_exec",
+                            "--nocapture",
+                        ])
+                        .env("SUDO_RS_TEST_DESCRIPTOR", fd.to_string())
+                        .env(
+                            "SUDO_RS_TEST_DESCRIPTOR_OPEN",
+                            if expected { "yes" } else { "no" },
+                        )
                         .status()
                         .unwrap()
                         .success()
@@ -1166,8 +1252,38 @@ mod tests {
     }
 
     #[test]
-    fn fd_directory_fallback_prevents_descriptor_inheritance() {
-        check_descriptor_inheritance(|| super::cloexec_via_fd_dir(3, super::FD_DIR).unwrap());
+    fn fallback_prevents_descriptor_inheritance() {
+        check_descriptor_inheritance(|| super::cloexec_fallback(3).unwrap());
+    }
+
+    #[test]
+    fn fallback_includes_descriptors_above_a_lowered_limit() {
+        check_descriptor_inheritance(|| {
+            // This callback runs in the isolated fork after fd 128 was opened.
+            let mut limit = std::mem::MaybeUninit::<libc::rlimit>::uninit();
+            // SAFETY: limit is writable; the successful call initializes it.
+            assert_eq!(
+                unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, limit.as_mut_ptr()) },
+                0
+            );
+            // SAFETY: getrlimit succeeded above.
+            let mut limit = unsafe { limit.assume_init() };
+            limit.rlim_cur = 64;
+            // SAFETY: limit is valid and only this isolated child is affected.
+            assert_eq!(unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &limit) }, 0);
+            super::cloexec_fallback(3).unwrap();
+        });
+    }
+
+    #[test]
+    fn descriptor_state_after_exec() {
+        let Ok(fd) = std::env::var("SUDO_RS_TEST_DESCRIPTOR") else {
+            return;
+        };
+        let fd = fd.parse::<libc::c_int>().unwrap();
+        let expected = std::env::var("SUDO_RS_TEST_DESCRIPTOR_OPEN").unwrap() == "yes";
+        // SAFETY: F_GETFD only queries the inherited descriptor's flags.
+        assert_eq!(unsafe { libc::fcntl(fd, libc::F_GETFD) } >= 0, expected);
     }
 
     #[test]

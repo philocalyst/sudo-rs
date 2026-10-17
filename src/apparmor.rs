@@ -46,10 +46,7 @@ fn apparmor_prepare_exec(new_profile: &str) -> io::Result<()> {
         return Err(if err.is_null() {
             // There was no error in dlsym, but the symbol itself was defined as NULL pointer.
             // This is still an error for us, but dlerror will not return any error.
-            io::Error::new(
-                io::ErrorKind::Other,
-                "aa_change_onexec symbol is a NULL pointer",
-            )
+            io::Error::other("aa_change_onexec symbol is a NULL pointer")
         } else {
             // SAFETY: In case of an error, dlerror returns a valid C string.
             io::Error::new(io::ErrorKind::NotFound, unsafe {
