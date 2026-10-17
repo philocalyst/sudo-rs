@@ -1,8 +1,14 @@
 //! The parts of the system interface that macOS provides in its own way.
 
-use std::{ffi::c_int, io, mem::MaybeUninit};
+use std::{
+    ffi::{CStr, c_int, c_uint},
+    io,
+    mem::MaybeUninit,
+};
 
-use super::{DeviceId, Process, ProcessCreateTime, WithProcess, set_errno};
+use crate::cutils::cerr;
+
+use super::{DeviceId, GroupId, Process, ProcessCreateTime, UserId, WithProcess, set_errno};
 
 /// The clock that counts the time since boot, including time spent asleep. Unlike on Linux,
 /// this is what macOS calls CLOCK_MONOTONIC, see clock_gettime(3).
@@ -118,5 +124,71 @@ fn proc_pidinfo_bytes(query: impl FnOnce() -> c_int) -> io::Result<usize> {
         Ok(0) if error.raw_os_error() != Some(0) => Err(error),
         Ok(written) => Ok(written),
         Err(_) => Err(error),
+    }
+}
+
+/// The number of groups that a credential caches, see
+/// https://github.com/apple-oss-distributions/xnu/blob/xnu-12377.121.6/bsd/sys/syslimits.h#L104
+const NGROUPS: usize = 16;
+
+unsafe extern "C" {
+    /// The system call that initgroups(3) ends in: it gives the current process the
+    /// `gidsetsize` groups at `gidset`, and lets the kernel ask Open Directory about the other
+    /// groups of the account `gmuid` when it checks membership. It is private to the system, but
+    /// libsystem_kernel exports it for initgroups in Libinfo, see
+    /// https://github.com/apple-oss-distributions/Libinfo/blob/Libinfo-600/lookup.subproj/libinfo.c#L894-L939
+    /// and https://github.com/apple-oss-distributions/xnu/blob/xnu-12377.121.6/bsd/kern/kern_prot.c#L1402-L1435
+    fn __initgroups(gidsetsize: c_uint, gidset: *const libc::gid_t, gmuid: c_int) -> c_int;
+}
+
+/// The groups that initgroups(3) has the credential cache for the account `name` with the
+/// primary group `primary`: that group first, then as many others of the account as fit.
+pub(super) fn cached_groups(name: &CStr, primary: GroupId) -> Vec<GroupId> {
+    let mut groups = vec![primary; NGROUPS];
+    let mut len = NGROUPS as c_int;
+    // Like initgroups, ignore that the account may be in more groups than fit.
+    // SAFETY: `groups` has room for `len` groups, and a GroupId is a gid_t, which getgrouplist
+    // takes as an int.
+    unsafe {
+        libc::getgrouplist(
+            name.as_ptr(),
+            primary.inner() as c_int,
+            groups.as_mut_ptr().cast(),
+            &mut len,
+        )
+    };
+    groups.truncate(len as usize);
+    groups
+}
+
+/// Give the current process the `cached` groups of the account `member`, like initgroups(3)
+/// does after looking them up. Unlike that lookup, this only makes a system call, so it is
+/// async-signal-safe.
+pub(super) fn set_cached_groups(cached: &[GroupId], member: UserId) -> io::Result<()> {
+    // SAFETY: `cached` holds as many groups as its length says, and a GroupId is a gid_t.
+    cerr(unsafe {
+        __initgroups(
+            cached.len() as c_uint,
+            cached.as_ptr().cast(),
+            member.inner() as c_int,
+        )
+    })?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{NGROUPS, cached_groups};
+    use crate::system::User;
+
+    #[test]
+    fn caches_what_initgroups_does() {
+        let user = User::real().unwrap().unwrap();
+
+        // The groups of a User come from getgrouplist with room for all of them, which initgroups
+        // asks with room for no more than a credential caches.
+        let cached = cached_groups(user.name.as_cstr(), user.gid);
+        assert_eq!(cached, user.groups[..user.groups.len().min(NGROUPS)]);
+        assert_eq!(cached[0], user.gid);
     }
 }

@@ -64,8 +64,12 @@ impl CurrentUser {
 
     pub fn resolve() -> Result<Self, Error> {
         let mut cur_user = User::real()?.ok_or(Error::UserNotFound("current user".to_string()))?;
-        // the current user can also have groups that are defined at runtime, so fetch the dynamic groups
-        cur_user.groups = User::real_groups()?;
+        // the current user can also have groups that are defined at runtime, so fetch the dynamic
+        // groups; except on macOS, where these are only the part of the account's groups that the
+        // kernel caches, and original sudo also uses the groups of the account there
+        if cfg!(not(target_os = "macos")) {
+            cur_user.groups = User::real_groups()?;
+        }
         Ok(Self { inner: cur_user })
     }
 }

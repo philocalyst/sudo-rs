@@ -1,4 +1,5 @@
 use std::{
+    collections::HashSet,
     ffi::{CStr, c_int, c_long},
     fmt, io,
     mem::MaybeUninit,
@@ -265,8 +266,6 @@ fn set_supplementary_groups(groups: &[GroupId]) -> io::Result<()> {
     let Ok(len) = groups.len().try_into() else {
         return Err(io::Error::other("too many groups"));
     };
-    #[cfg(target_os = "macos")]
-    let len = std::cmp::min(16, len);
     // SAFETY: setgroups is passed a valid pointer to a chunk of memory of the correct size
     // We can cast to gid_t because `GroupId` is marked as transparent
     cerr(unsafe { libc::setgroups(len, groups.as_ptr().cast::<libc::gid_t>()) })?;
@@ -274,23 +273,127 @@ fn set_supplementary_groups(groups: &[GroupId]) -> io::Result<()> {
     Ok(())
 }
 
+/// The supplementary groups to give to a process.
+pub(crate) enum SupplementaryGroups {
+    /// Exactly these groups; the first is the primary group.
+    List(Vec<GroupId>),
+    /// The groups of the account `member`. A macOS credential holds at most 16 groups, which the
+    /// kernel treats as a cache: it asks Open Directory about the account's other memberships,
+    /// unless setgroups has turned that off for good, see
+    /// https://github.com/apple-oss-distributions/xnu/blob/xnu-12377.121.6/bsd/kern/kern_prot.c#L1402-L1467
+    #[cfg(target_os = "macos")]
+    Account {
+        cached: Vec<GroupId>,
+        member: UserId,
+    },
+}
+
+impl SupplementaryGroups {
+    /// Exactly `groups`, with `primary` as the primary group.
+    pub(crate) fn list(mut groups: Vec<GroupId>, primary: GroupId) -> Self {
+        inject_group(primary, &mut groups);
+        Self::List(groups)
+    }
+
+    /// The groups of `user`, with `primary` as the primary group.
+    #[cfg(not(target_os = "macos"))]
+    pub(crate) fn of(user: &User, primary: GroupId) -> Self {
+        Self::list(user.groups.clone(), primary)
+    }
+
+    /// The groups of `user`, with `primary` as the primary group.
+    ///
+    /// They are looked up here as initgroups(3) would look them up, so that installing them takes
+    /// no more than the system call that initgroups ends in. The lookup asks opendirectoryd over
+    /// XPC, which is no more async-signal-safe than the locks it takes, so it must not happen
+    /// between fork and exec.
+    #[cfg(target_os = "macos")]
+    pub(crate) fn of(user: &User, primary: GroupId) -> Self {
+        Self::Account {
+            cached: os::cached_groups(user.name.as_cstr(), primary),
+            member: user.uid,
+        }
+    }
+
+    /// The groups of the current process.
+    #[cfg(not(target_os = "macos"))]
+    pub(crate) fn current() -> io::Result<Self> {
+        // SAFETY: calling with size 0 does not modify through the pointer, and is
+        // a documented way of getting the length needed.
+        let len = cerr(unsafe { libc::getgroups(0, std::ptr::null_mut()) })?;
+
+        let mut groups = vec![GroupId::new(0); len as usize];
+        // SAFETY: we pass a correct pointer to a slice of the given length
+        cerr(unsafe {
+            // We can cast to gid_t because `GroupId` is marked as transparent
+            libc::getgroups(len, groups.as_mut_ptr().cast::<libc::gid_t>())
+        })?;
+
+        Ok(Self::List(groups))
+    }
+
+    /// The groups of the current process, which are those of the invoking user. getgroups would
+    /// only reveal the part that the kernel caches, and installing just those would lose the
+    /// others, see https://github.com/apple-oss-distributions/xnu/blob/xnu-12377.121.6/bsd/kern/kern_prot.c#L422-L452
+    #[cfg(target_os = "macos")]
+    pub(crate) fn current() -> io::Result<Self> {
+        let user = User::from_uid(User::real_uid())
+            .map_err(|err| io::Error::other(err.to_string()))?
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "invoking user not found"))?;
+
+        Ok(Self::of(&user, User::effective_gid()))
+    }
+
+    /// Whether both refer to the same groups, in any order.
+    pub(crate) fn is_same_as(&self, other: &Self) -> bool {
+        self.comparable() == other.comparable()
+    }
+
+    /// The groups, and the account that the kernel looks up further groups for, if any.
+    fn comparable(&self) -> (HashSet<GroupId>, Option<UserId>) {
+        match self {
+            Self::List(groups) => (groups.iter().copied().collect(), None),
+            #[cfg(target_os = "macos")]
+            Self::Account { cached, member } => (cached.iter().copied().collect(), Some(*member)),
+        }
+    }
+
+    /// Give these groups to the current process. This only makes system calls, so it is
+    /// async-signal-safe.
+    pub(crate) fn install(&self) -> io::Result<()> {
+        match self {
+            Self::List(groups) => set_supplementary_groups(groups),
+            #[cfg(target_os = "macos")]
+            Self::Account { cached, member } => os::set_cached_groups(cached, *member),
+        }
+    }
+}
+
 /// set target user and groups (uid, gid, additional groups) for a command
+///
+/// Unless `groups` lists the supplementary groups explicitly, the command gets those of the
+/// target user.
 pub fn set_target_user(
     cmd: &mut std::process::Command,
-    mut target_user: User,
+    target_user: User,
     target_group: Group,
+    groups: Option<&[GroupId]>,
 ) {
     use std::os::unix::process::CommandExt;
 
-    inject_group(target_group.gid, &mut target_user.groups);
+    let groups = match groups {
+        Some(groups) => SupplementaryGroups::list(groups.to_vec(), target_group.gid),
+        None => SupplementaryGroups::of(&target_user, target_group.gid),
+    };
 
     // we need to do this in a `pre_exec` call since the `groups` method in `process::Command` is unstable
     // see https://github.com/rust-lang/rust/blob/a01b4cc9f375f1b95fa8195daeea938d3d9c4c34/library/std/src/sys/unix/process/process_unix.rs#L329-L352
     // for the std implementation of the libc calls to `setgroups`, `setgid` and `setuid`
-    // SAFETY: Setuid, setgid and setgroups are async-signal-safe.
+    // SAFETY: Installing the groups, setgid and setuid only make system calls, which are
+    // async-signal-safe: the groups were looked up before forking.
     unsafe {
         cmd.pre_exec(move || {
-            set_supplementary_groups(&target_user.groups)?;
+            groups.install()?;
             // setgid and setuid set the real, effective and saved version of the gid and uid
             // respectively rather than just the real gid and uid. The original sudo uses setresgid
             // and setresuid instead with all three arguments equal, but as this does the same as

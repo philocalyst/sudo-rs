@@ -10,7 +10,10 @@ use crate::common::{error::Error, resolve::CurrentUser};
 use crate::exec::{RunOptions, Umask};
 use crate::log::user_warn;
 use crate::system::{Group, User};
-use crate::{common::resolve::is_valid_executable, system::interface::UserId};
+use crate::{
+    common::resolve::is_valid_executable,
+    system::interface::{GroupId, UserId},
+};
 
 type Environment = HashMap<OsString, OsString>;
 
@@ -32,6 +35,8 @@ pub(crate) struct SuContext {
     pub(crate) user: User,
     pub(crate) requesting_user: CurrentUser,
     group: Group,
+    /// Groups requested on the command line, which replace those of `user`.
+    groups: Option<Vec<GroupId>>,
 }
 
 /// check that a shell is not restricted / exists in /etc/shells
@@ -75,7 +80,7 @@ impl SuContext {
         let requesting_user = CurrentUser::resolve()?;
 
         // resolve target user
-        let mut user = User::from_name(options.user.as_cstr())?
+        let user = User::from_name(options.user.as_cstr())?
             .ok_or_else(|| Error::UserNotFound(options.user.clone().into()))?;
 
         // check the current user is root
@@ -91,10 +96,7 @@ impl SuContext {
 
         // resolve target group
         let mut group = user.primary_group()?;
-
-        if !options.supp_group.is_empty() || !options.group.is_empty() {
-            user.groups.clear();
-        }
+        let mut groups = Vec::new();
 
         for group_name in options.group.iter() {
             let primary_group = Group::from_name(group_name.as_cstr())?
@@ -102,7 +104,7 @@ impl SuContext {
 
             // last argument is the primary group
             group = primary_group.clone();
-            user.groups.insert(0, primary_group.gid);
+            groups.insert(0, primary_group.gid);
         }
 
         // add additional group if current user is root
@@ -115,7 +117,7 @@ impl SuContext {
                 group = supp_group.clone();
             }
 
-            user.groups.push(supp_group.gid);
+            groups.push(supp_group.gid);
         }
 
         // the shell specified with --shell
@@ -191,6 +193,7 @@ impl SuContext {
             user,
             requesting_user,
             group,
+            groups: (!groups.is_empty()).then_some(groups),
         })
     }
 }
@@ -205,6 +208,7 @@ impl SuContext {
             is_login: self.options.login,
             user: &self.user,
             group: &self.group,
+            groups: self.groups.as_deref(),
             umask: Umask::Preserve,
 
             background: false,

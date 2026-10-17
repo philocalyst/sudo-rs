@@ -1,5 +1,4 @@
 #![cfg_attr(not(feature = "unstable-remote-sudoers"), allow(unused_imports))]
-use std::collections::HashSet;
 use std::ffi::{CStr, CString, c_int, c_uint};
 use std::fs::{self, DirBuilder, File, Metadata, OpenOptions};
 use std::io::{self, BufReader, Error, ErrorKind};
@@ -13,9 +12,7 @@ use std::os::unix::{
 };
 use std::path::{Component, Path};
 
-use super::{
-    Group, GroupId, User, UserId, cerr, inject_group, interface::UnixUser, set_supplementary_groups,
-};
+use super::{Group, GroupId, SupplementaryGroups, User, UserId, cerr, interface::UnixUser};
 use crate::common::resolve::CurrentUser;
 
 #[cfg(target_os = "linux")]
@@ -33,41 +30,24 @@ pub(crate) fn sudo_call<T>(
     target_group: &Group,
     operation: impl FnOnce() -> T,
 ) -> io::Result<T> {
-    const KEEP_GID: libc::gid_t = -1i32 as libc::gid_t;
-
     // SAFETY: these libc functions are always safe to call
     let (cur_user_id, cur_group_id) =
         unsafe { (UserId::new(libc::geteuid()), GroupId::new(libc::getegid())) };
 
-    let cur_groups = {
-        // SAFETY: calling with size 0 does not modify through the pointer, and is
-        // a documented way of getting the length needed.
-        let len = cerr(unsafe { libc::getgroups(0, std::ptr::null_mut()) })?;
-
-        let mut buf: Vec<GroupId> = vec![GroupId::new(KEEP_GID); len as usize];
-        // SAFETY: we pass a correct pointer to a slice of the given length
-        cerr(unsafe {
-            // We can cast to gid_t because `GroupId` is marked as transparent
-            libc::getgroups(len, buf.as_mut_ptr().cast::<libc::gid_t>())
-        })?;
-
-        buf
-    };
-
-    let mut target_groups = target_user.groups.clone();
-    inject_group(target_group.gid, &mut target_groups);
+    let cur_groups = SupplementaryGroups::current()?;
+    let target_groups = SupplementaryGroups::of(target_user, target_group.gid);
 
     if cfg!(test)
         && target_user.uid == cur_user_id
         && target_group.gid == cur_group_id
-        && target_groups.iter().collect::<HashSet<_>>() == cur_groups.iter().collect::<HashSet<_>>()
+        && target_groups.is_same_as(&cur_groups)
     {
         // we are not actually switching users, simply run the closure
         // (this would also be safe in production mode, but it is a needless check)
         return Ok(operation());
     }
 
-    struct ResetUserGuard(UserId, GroupId, Vec<GroupId>);
+    struct ResetUserGuard(UserId, GroupId, SupplementaryGroups);
 
     impl Drop for ResetUserGuard {
         fn drop(&mut self) {
@@ -77,7 +57,7 @@ pub(crate) fn sudo_call<T>(
                 cerr(unsafe { libc::seteuid(UserId::inner(&self.0)) })?;
                 // SAFETY: this function is always safe to call
                 cerr(unsafe { libc::setegid(GroupId::inner(&self.1)) })?;
-                set_supplementary_groups(&self.2)
+                self.2.install()
             })()
             .expect("could not restore to saved user id");
         }
@@ -86,7 +66,7 @@ pub(crate) fn sudo_call<T>(
     let guard = ResetUserGuard(cur_user_id, cur_group_id, cur_groups);
 
     // Only the effective ids change, so the saved set-user-ID still allows switching back.
-    set_supplementary_groups(&target_groups)?;
+    target_groups.install()?;
     // SAFETY: this function is always safe to call
     cerr(unsafe { libc::setegid(GroupId::inner(&target_group.gid)) })?;
     // SAFETY: this function is always safe to call

@@ -25,7 +25,7 @@ use crate::{
     log::{dev_info, dev_warn, user_error},
     system::{
         _exit, ForkResult, Group, User, fork,
-        interface::ProcessId,
+        interface::{GroupId, ProcessId},
         kill, killpg, mark_fds_as_cloexec, set_target_user, setpgid,
         signal::{SignalNumber, SignalSet, SignalsState, consts::*, exit_with_signal, signal_name},
         term::UserTerm,
@@ -68,6 +68,8 @@ pub struct RunOptions<'a> {
     pub is_login: bool,
     pub user: &'a User,
     pub group: &'a Group,
+    /// Supplementary groups to use instead of those of `user`.
+    pub groups: Option<&'a [GroupId]>,
     pub umask: Umask,
 
     pub background: bool,
@@ -139,7 +141,12 @@ pub fn run_command(
         .clone();
 
     // set target user and groups
-    set_target_user(&mut command, options.user.clone(), options.group.clone());
+    set_target_user(
+        &mut command,
+        options.user.clone(),
+        options.group.clone(),
+        options.groups,
+    );
 
     // change current directory if necessary.
     if let Some(path) = path {

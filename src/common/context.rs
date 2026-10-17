@@ -284,6 +284,7 @@ impl Context {
             is_login: self.launch == LaunchType::Login,
             user: &self.target_user,
             group: &self.target_group,
+            groups: None,
             umask: controls.umask,
 
             background: self.background,
