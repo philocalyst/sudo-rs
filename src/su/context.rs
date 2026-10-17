@@ -19,8 +19,14 @@ use super::cli::SuRunOptions;
 const VALID_LOGIN_SHELLS_LIST: &str = "/etc/shells";
 const FALLBACK_LOGIN_SHELL: &str = "/bin/sh";
 
-// TODO: use _PATH_STDPATH and _PATH_DEFPATH_ROOT from paths.h
+// Darwin's _PATH_DEFPATH and _PATH_STDPATH from paths.h.
+#[cfg(target_os = "macos")]
+const PATH_DEFAULT: &str = "/usr/bin:/bin";
+#[cfg(target_os = "macos")]
+const PATH_DEFAULT_ROOT: &str = "/usr/bin:/bin:/usr/sbin:/sbin";
+#[cfg(not(target_os = "macos"))]
 const PATH_DEFAULT: &str = "/usr/local/bin:/usr/bin:/bin:/usr/local/games:/usr/games";
+#[cfg(not(target_os = "macos"))]
 const PATH_DEFAULT_ROOT: &str = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
 
 #[derive(Debug)]
@@ -246,6 +252,39 @@ mod tests {
         let context = SuContext::from_env(options).unwrap();
 
         assert_eq!(context.user.name, "root");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn login_environment_uses_native_search_paths() {
+        let user = User::real().unwrap().unwrap();
+        for (name, path) in [
+            ("root", "/usr/bin:/bin:/usr/sbin:/sbin"),
+            (user.name.as_ref(), "/usr/bin:/bin"),
+        ] {
+            let context = SuContext::from_env(get_options(&["-l", name])).unwrap();
+            assert_eq!(
+                context
+                    .environment
+                    .get(std::ffi::OsStr::new("PATH"))
+                    .unwrap(),
+                path
+            );
+            assert_eq!(
+                context
+                    .environment
+                    .get(std::ffi::OsStr::new("USER"))
+                    .unwrap(),
+                name
+            );
+            assert_eq!(
+                context
+                    .environment
+                    .get(std::ffi::OsStr::new("LOGNAME"))
+                    .unwrap(),
+                name
+            );
+        }
     }
 
     #[test]

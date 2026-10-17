@@ -320,7 +320,11 @@ impl<'a> TimeoutRead<'a> {
 
 impl TimeoutRead<'_> {
     fn read_byte(&mut self) -> io::Result<Option<u8>> {
+        // Darwin has no POLLRDHUP; a half-closed peer shows up as POLLHUP.
+        #[cfg(not(target_os = "macos"))]
         let pollmask = libc::POLLIN | libc::POLLRDHUP;
+        #[cfg(target_os = "macos")]
+        let pollmask = libc::POLLIN;
 
         let mut pollfd = [libc::pollfd {
             fd: self.fd.as_raw_fd(),
@@ -352,8 +356,21 @@ impl TimeoutRead<'_> {
             )
         })?;
 
+        let revents = pollfd[0].revents;
+
+        // poll reports these two whether or not they were asked for, and no
+        // amount of waiting clears them. Neither is a timeout, and the
+        // descriptor is never put in non-blocking mode here, so reading it in
+        // this state could block for good.
+        if revents & libc::POLLNVAL != 0 {
+            return Err(io::Error::from_raw_os_error(libc::EBADF));
+        }
+        if revents & libc::POLLERR != 0 {
+            return Err(io::Error::from_raw_os_error(libc::EIO));
+        }
+
         // There may yet be data waiting to be read even if POLLHUP is set.
-        if pollfd[0].revents & (pollmask | libc::POLLHUP) > 0 {
+        if revents & (pollmask | libc::POLLHUP) != 0 {
             let mut buf = [0u8];
 
             // SAFETY: buf is initialized and its length matches

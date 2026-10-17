@@ -2,7 +2,7 @@
 #[cfg(target_os = "linux")]
 use std::str::FromStr;
 use std::{
-    ffi::{CStr, c_int, c_long, c_uint},
+    ffi::{CStr, c_int, c_long},
     fmt, fs, io,
     mem::MaybeUninit,
     ops,
@@ -16,12 +16,18 @@ use crate::{
 };
 use interface::{DeviceId, GroupId, ProcessId, UserId};
 pub use libc::PATH_MAX;
-use libc::{CLOSE_RANGE_CLOEXEC, EINVAL, ENOSYS, STDERR_FILENO};
+use libc::STDERR_FILENO;
+#[cfg(not(target_os = "macos"))]
+use libc::{CLOSE_RANGE_CLOEXEC, EINVAL, ENOSYS};
+#[cfg(not(target_os = "macos"))]
+use std::ffi::c_uint;
 use time::ProcessCreateTime;
 
 use self::signal::SignalNumber;
 
 pub(crate) mod audit;
+#[cfg(target_os = "macos")]
+pub(crate) mod macos;
 // generalized traits for when we want to hide implementations
 pub mod interface;
 
@@ -37,8 +43,8 @@ pub mod term;
 
 pub mod wait;
 
-#[cfg(not(any(target_os = "freebsd", target_os = "linux")))]
-compile_error!("sudo-rs only works on Linux and FreeBSD");
+#[cfg(not(any(target_os = "freebsd", target_os = "linux", target_os = "macos")))]
+compile_error!("sudo-rs only works on Linux, FreeBSD and MacOS");
 
 pub(crate) fn _exit(status: c_int) -> ! {
     // SAFETY: this function is safe to call
@@ -57,6 +63,7 @@ fn set_cloexec(fd: c_int) -> io::Result<()> {
 
 /// Attempts close_range(CLOSE_RANGE_CLOEXEC) for all fds >= lowfd.
 /// Returns Ok(true) on success, Ok(false) if unsupported, Err on any other failure.
+#[cfg(not(target_os = "macos"))]
 fn try_close_range(lowfd: c_int) -> io::Result<bool> {
     // SAFETY: this function is safe to call:
     // - any errors while closing a specific fd will be effectively ignored
@@ -88,7 +95,7 @@ fn try_close_range(lowfd: c_int) -> io::Result<bool> {
 }
 
 /// Sets CLOEXEC on all fds >= lowfd by walking an fd directory
-/// (/proc/self/fd on Linux, /dev/fd on FreeBSD).
+/// (/proc/self/fd on Linux, /dev/fd on FreeBSD and macOS).
 fn cloexec_via_fd_dir(lowfd: c_int, path: &str) -> io::Result<()> {
     for entry in fs::read_dir(path)? {
         let file_name = entry?.file_name();
@@ -123,13 +130,25 @@ const FD_DIR: &str = "/dev/fd";
 pub(crate) fn mark_fds_as_cloexec() -> io::Result<()> {
     let lowfd = STDERR_FILENO + 1;
 
-    if try_close_range(lowfd)? {
-        return Ok(());
-    }
-
     // The kernel doesn't support close_range or CLOSE_RANGE_CLOEXEC,
     // so fall back to enumerating the platform's fd directory.
-    cloexec_via_fd_dir(lowfd, FD_DIR)
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        if try_close_range(lowfd)? {
+            return Ok(());
+        }
+
+        cloexec_via_fd_dir(lowfd, FD_DIR)
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        if macos::mark_fds_as_cloexec(lowfd)? {
+            return Ok(());
+        }
+        cloexec_via_fd_dir(lowfd, FD_DIR)
+    }
 }
 
 pub(crate) enum ForkResult {
@@ -287,7 +306,7 @@ fn inject_group(target: GroupId, groups: &mut Vec<GroupId>) {
 
 /// Set the supplementary groups -- returns a c_int to mimic a libc function
 fn set_supplementary_groups(groups: &[GroupId]) -> io::Result<()> {
-    // On FreeBSD, setgruops expects the size to be passed as a i32, so the below
+    // On FreeBSD and macOS, setgroups expects the size to be passed as an i32, so the below
     // conversion protects a very extreme case of arithmetic conversion error
     #[allow(irrefutable_let_patterns)]
     #[allow(clippy::useless_conversion)]
@@ -403,8 +422,8 @@ impl User {
                 let result = unsafe {
                     libc::getgrouplist(
                         pwd.pw_name,
-                        pwd.pw_gid,
-                        groups_buffer.as_mut_ptr(),
+                        pwd.pw_gid as _,
+                        groups_buffer.as_mut_ptr().cast(),
                         &mut buf_len,
                     )
                 };
@@ -797,7 +816,7 @@ impl Process {
                 }
                 Err(e) if e.raw_os_error() == Some(libc::ENOMEM) => {
                     // Vector not big enough. Grow it by 10% and try again.
-                    ki_proc.reserve(ki_proc.capacity() + (ki_proc.capacity() + 9) / 10);
+                    ki_proc.reserve(ki_proc.capacity() + ki_proc.capacity().div_ceil(10));
                 }
                 Err(e) => return Err(e),
             }
@@ -817,6 +836,17 @@ impl Process {
         } else {
             Ok(Some(DeviceId::new(ki_proc.ki_tdev)))
         }
+    }
+
+    /// Returns the device identifier of the TTY device that is currently
+    /// attached to the given process
+    #[cfg(target_os = "macos")]
+    pub fn tty_device_id(pid: WithProcess) -> std::io::Result<Option<DeviceId>> {
+        // proc_bsdinfo stores the controlling device unsigned; a process
+        // without one carries NODEV, which is dev_t's -1.
+        const NODEV: u32 = -1i32 as u32;
+        let info = macos::process_info(pid)?;
+        Ok((info.e_tdev != NODEV).then(|| DeviceId::new(info.e_tdev as libc::dev_t)))
     }
 
     /// Get the process starting time of a specific process
@@ -847,6 +877,21 @@ impl Process {
         Ok(ProcessCreateTime::new(
             i64::from(ki_start.tv_sec),
             i64::from(ki_start.tv_usec) * 1000,
+        ))
+    }
+
+    /// Get the process starting time of a specific process
+    #[cfg(target_os = "macos")]
+    pub fn starting_time(pid: WithProcess) -> io::Result<ProcessCreateTime> {
+        let info = macos::process_info(pid)?;
+        let secs = i64::try_from(info.pbi_start_tvsec)
+            .map_err(|_| io::Error::other("invalid process start time"))?;
+        if info.pbi_start_tvusec >= 1_000_000 {
+            return Err(io::Error::other("invalid process start time"));
+        }
+        Ok(ProcessCreateTime::new(
+            secs,
+            info.pbi_start_tvusec as i64 * 1000,
         ))
     }
 }
