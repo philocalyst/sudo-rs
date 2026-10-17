@@ -18,6 +18,9 @@ pub fn run_edit(edit_opts: SudoEditOptions) -> Result<(), Error> {
     // sudoedit runs the editor without applying a profile, so a policy that
     // selects one is refused rather than silently edited unconfined.
     super::ensure_apparmor_profile_supported(&controls)?;
+    crate::apparmor::ensure_edit_profile_supported(controls.apparmor_profile.as_deref()).map_err(
+        |err| Error::AppArmor(controls.apparmor_profile.clone().unwrap_or_default(), err),
+    )?;
 
     let mut pam_context = super::auth_and_update_record_file(&context, auth)?;
 

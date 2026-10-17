@@ -22,33 +22,59 @@ pub const SUPPORTED: bool = cfg!(all(feature = "apparmor", target_os = "linux"))
 /// Refuse a profile that this build could never apply.
 ///
 /// Call this before authenticating, so that a policy demanding confinement
-/// sudo-rs cannot provide stops before it has any effect, rather than running
-/// the command unconfined. Whether the running kernel has AppArmor enabled is
-/// a separate, deliberately soft failure handled by
-/// [`set_profile_for_next_exec`].
+/// sudo-rs cannot provide stops before it has any effect. Checking availability
+/// does not set a pending exec profile, so PAM helpers remain unaffected.
 pub fn ensure_profile_supported(profile_name: Option<&str>) -> io::Result<()> {
-    match profile_name {
-        Some(_) if !SUPPORTED => Err(io::Error::new(
+    if profile_name.is_none() {
+        return Ok(());
+    }
+    if !SUPPORTED {
+        return Err(io::Error::new(
             io::ErrorKind::Unsupported,
             if cfg!(target_os = "linux") {
                 xlat!("sudo-rs was built without AppArmor support")
             } else {
                 xlat!("AppArmor is only available on Linux")
             },
-        )),
-        _ => Ok(()),
+        ));
+    }
+    #[cfg(all(feature = "apparmor", target_os = "linux"))]
+    require_enabled_kernel(apparmor_is_enabled()?)?;
+    Ok(())
+}
+
+/// The edit pipeline has no profile transition for its unprivileged editor.
+/// Refuse the restriction until that pipeline has explicit support; setting a
+/// pending profile on privileged sudo is not a substitute for confining the editor.
+pub fn ensure_edit_profile_supported(profile_name: Option<&str>) -> io::Result<()> {
+    if profile_name.is_some() {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            xlat!("AppArmor profiles cannot be enforced for sudoedit"),
+        ))
+    } else {
+        Ok(())
     }
 }
 
-/// Set the profile for the next exec call if AppArmor is enabled
+#[cfg(any(test, all(feature = "apparmor", target_os = "linux")))]
+fn require_enabled_kernel(enabled: bool) -> io::Result<()> {
+    if enabled {
+        Ok(())
+    } else {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            xlat!("AppArmor is not enabled in the running kernel"),
+        ))
+    }
+}
+
+/// Require the selected profile on the next exec, including at the final check
+/// after authentication. A requested restriction must never fail open.
 #[cfg(all(feature = "apparmor", target_os = "linux"))]
 pub fn set_profile_for_next_exec(profile_name: &str) -> io::Result<()> {
-    if apparmor_is_enabled()? {
-        apparmor_prepare_exec(profile_name)
-    } else {
-        // if the sysadmin doesn't have apparmor enabled, fail softly
-        Ok(())
-    }
+    require_enabled_kernel(apparmor_is_enabled()?)?;
+    apparmor_prepare_exec(profile_name)
 }
 
 #[cfg(all(feature = "apparmor", target_os = "linux"))]
@@ -115,17 +141,32 @@ mod tests {
         assert!(ensure_profile_supported(None).is_ok());
     }
 
+    #[cfg(not(all(feature = "apparmor", target_os = "linux")))]
     #[test]
-    fn a_selected_profile_is_refused_unless_it_can_be_applied() {
+    fn a_selected_profile_is_refused_by_an_unsupported_build() {
         let result = ensure_profile_supported(Some("confined"));
-        if SUPPORTED {
-            // Whether the running kernel has AppArmor loaded is decided later,
-            // by set_profile_for_next_exec; this check is about the build.
-            assert!(result.is_ok());
-        } else {
-            let err = result.unwrap_err();
-            assert_eq!(err.kind(), io::ErrorKind::Unsupported);
-            assert!(!err.to_string().is_empty());
-        }
+        let err = result.unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::Unsupported);
+        assert!(!err.to_string().is_empty());
+    }
+
+    #[test]
+    fn a_selected_profile_requires_an_enabled_kernel() {
+        assert!(require_enabled_kernel(true).is_ok());
+        assert_eq!(
+            require_enabled_kernel(false).unwrap_err().kind(),
+            io::ErrorKind::Unsupported
+        );
+    }
+
+    #[test]
+    fn sudoedit_never_silently_discards_a_selected_profile() {
+        assert!(ensure_edit_profile_supported(None).is_ok());
+        assert_eq!(
+            ensure_edit_profile_supported(Some("confined"))
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::Unsupported
+        );
     }
 }
