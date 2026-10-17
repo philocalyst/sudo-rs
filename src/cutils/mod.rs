@@ -1,7 +1,7 @@
 use std::{
     ffi::{CStr, OsStr, OsString, c_char, c_int, c_long},
     os::{
-        fd::{AsRawFd, BorrowedFd},
+        fd::{AsRawFd, BorrowedFd, FromRawFd, OwnedFd},
         unix::prelude::OsStrExt,
     },
 };
@@ -136,11 +136,42 @@ pub fn dynamic_fill<T: Default + Copy, E>(
     }
 }
 
+/// Create a pipe whose ends will not survive exec.
+pub fn pipe_cloexec() -> std::io::Result<(OwnedFd, OwnedFd)> {
+    let mut fds = [-1; 2];
+    // SAFETY: pipe2 receives space for exactly two descriptors.
+    unsafe {
+        cerr(libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC))?;
+    }
+    // SAFETY: a successful pipe2 call initialized two new, owned descriptors.
+    Ok(unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) })
+}
+
 #[allow(clippy::undocumented_unsafe_blocks)]
 #[cfg(test)]
 mod test {
 
     use super::{dynamic_fill, os_string_from_ptr, string_from_ptr};
+
+    #[test]
+    fn pipe_is_cloexec_and_transfers_data() {
+        use std::io::{Read, Write};
+        use std::os::fd::AsRawFd;
+        let (rx, tx) = super::pipe_cloexec().unwrap();
+        for fd in [&rx, &tx] {
+            let flags = super::cerr(unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_GETFD) }).unwrap();
+            assert_ne!(flags & libc::FD_CLOEXEC, 0);
+            let flags = super::cerr(unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_GETFL) }).unwrap();
+            assert_eq!(flags & libc::O_NONBLOCK, 0);
+        }
+        let mut rx = std::fs::File::from(rx);
+        let mut tx = std::fs::File::from(tx);
+        tx.write_all(b"pipe data").unwrap();
+        drop(tx);
+        let mut data = Vec::new();
+        rx.read_to_end(&mut data).unwrap();
+        assert_eq!(data, b"pipe data");
+    }
 
     #[test]
     fn miri_test_str_to_ptr() {

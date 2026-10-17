@@ -45,10 +45,19 @@ pub(crate) fn _exit(status: c_int) -> ! {
     unsafe { libc::_exit(status) }
 }
 
-/// Mark every file descriptor that is not one of the IO streams as CLOEXEC.
-pub(crate) fn mark_fds_as_cloexec() -> io::Result<()> {
-    let lowfd = STDERR_FILENO + 1;
+fn set_cloexec(fd: c_int) -> io::Result<()> {
+    // SAFETY: This only sets the CLOEXEC flag; it does not close or invalidate the fd.
+    match unsafe { cerr(libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC)) } {
+        Ok(_) => Ok(()),
+        // An enumerated descriptor may have disappeared since the snapshot.
+        Err(err) if err.raw_os_error() == Some(libc::EBADF) => Ok(()),
+        Err(err) => Err(err),
+    }
+}
 
+/// Attempts close_range(CLOSE_RANGE_CLOEXEC) for all fds >= lowfd.
+/// Returns Ok(true) on success, Ok(false) if unsupported, Err on any other failure.
+fn try_close_range(lowfd: c_int) -> io::Result<bool> {
     // SAFETY: this function is safe to call:
     // - any errors while closing a specific fd will be effectively ignored
     #[allow(clippy::diverging_sub_expression)]
@@ -71,44 +80,56 @@ pub(crate) fn mark_fds_as_cloexec() -> io::Result<()> {
             ));
         }
     };
-
     match res {
-        Err(err) if err.raw_os_error() == Some(ENOSYS) || err.raw_os_error() == Some(EINVAL) => {
-            // The kernel doesn't support close_range or CLOSE_RANGE_CLOEXEC,
-            // fallback to finding all open fds using /proc/self/fd.
-
-            // FIXME use /dev/fd on macOS
-            for entry in fs::read_dir("/proc/self/fd")? {
-                let entry = entry?;
-                let file_name = entry.file_name();
-                let file_name = file_name.to_str().ok_or(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "procfs returned non-integer fd name",
-                ))?;
-                if file_name == "." || file_name == ".." {
-                    continue;
-                }
-                let fd = file_name.parse::<c_int>().map_err(|_| {
-                    io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        "procfs returned non-integer fd name",
-                    )
-                })?;
-                if fd < lowfd {
-                    continue;
-                }
-                // SAFETY: This only sets the CLOEXEC flag for the given fd. Nothing is
-                // going to need it after exec.
-                unsafe {
-                    cerr(libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC))?;
-                }
-            }
-
-            Ok(())
-        }
-        Err(err) => Err(err),
-        Ok(_) => Ok(()),
+        Ok(_) => Ok(true),
+        Err(e) if e.raw_os_error() == Some(ENOSYS) || e.raw_os_error() == Some(EINVAL) => Ok(false),
+        Err(e) => Err(e),
     }
+}
+
+/// Sets CLOEXEC on all fds >= lowfd by walking an fd directory
+/// (/proc/self/fd on Linux, /dev/fd on FreeBSD).
+fn cloexec_via_fd_dir(lowfd: c_int, path: &str) -> io::Result<()> {
+    for entry in fs::read_dir(path)? {
+        let file_name = entry?.file_name();
+
+        if file_name == "." || file_name == ".." {
+            continue;
+        }
+
+        let fd = file_name
+            .to_str()
+            .and_then(|s| s.parse::<c_int>().ok())
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "fd directory returned non-integer fd name",
+                )
+            })?;
+
+        if fd >= lowfd {
+            set_cloexec(fd)?;
+        }
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+const FD_DIR: &str = "/proc/self/fd";
+#[cfg(not(target_os = "linux"))]
+const FD_DIR: &str = "/dev/fd";
+
+/// Mark every file descriptor that is not one of the IO streams as CLOEXEC.
+pub(crate) fn mark_fds_as_cloexec() -> io::Result<()> {
+    let lowfd = STDERR_FILENO + 1;
+
+    if try_close_range(lowfd)? {
+        return Ok(());
+    }
+
+    // The kernel doesn't support close_range or CLOSE_RANGE_CLOEXEC,
+    // so fall back to enumerating the platform's fd directory.
+    cloexec_via_fd_dir(lowfd, FD_DIR)
 }
 
 pub(crate) enum ForkResult {
@@ -145,7 +166,6 @@ pub(crate) unsafe fn fork() -> io::Result<ForkResult> {
 unsafe fn fork_for_test(child_func: impl FnOnce() -> std::convert::Infallible) -> ProcessId {
     use std::io::Write;
     use std::panic::{AssertUnwindSafe, catch_unwind};
-    use std::process::exit;
 
     // SAFETY: Not really safe, but this is test only code.
     match unsafe { fork() }.unwrap() {
@@ -165,7 +185,8 @@ unsafe fn fork_for_test(child_func: impl FnOnce() -> std::convert::Infallible) -
             };
             let _ = writeln!(std::io::stderr(), "{s}");
 
-            exit(101);
+            // Runtime cleanup can acquire locks held by threads lost at fork.
+            _exit(101);
         }
         ForkResult::Parent(pid) => pid,
     }
@@ -931,7 +952,6 @@ mod tests {
             fd::{AsFd, AsRawFd},
             unix::net::UnixStream,
         },
-        process::exit,
     };
 
     use libc::SIGKILL;
@@ -939,7 +959,7 @@ mod tests {
     use crate::system::interface::{GroupId, ProcessId, UserId};
 
     use super::{
-        Group, ROOT_GROUP_NAME, User, WithProcess, fork_for_test, getpgrp, setpgid,
+        _exit as exit, Group, ROOT_GROUP_NAME, User, WithProcess, fork_for_test, getpgrp, setpgid,
         wait::{Wait, WaitOptions},
     };
 
@@ -1109,6 +1129,45 @@ mod tests {
         crate::cutils::cerr(unsafe { libc::fcntl(fd.as_fd().as_raw_fd(), libc::F_GETFD) }).unwrap()
             & libc::FD_CLOEXEC
             == libc::FD_CLOEXEC
+    }
+
+    fn check_descriptor_inheritance(mark: impl Fn()) {
+        let child = unsafe {
+            fork_for_test(|| {
+                let file = std::fs::File::open("/dev/null").unwrap();
+                // F_DUPFD deliberately creates a sparse, inheritable descriptor.
+                let fd =
+                    crate::cutils::cerr(libc::fcntl(file.as_raw_fd(), libc::F_DUPFD, 128)).unwrap();
+                let open_in_child = |expected: bool| {
+                    let op = if expected { "-e" } else { "! -e" };
+                    std::process::Command::new("/bin/sh")
+                        .args(["-c", &format!("test {op} /dev/fd/{fd}")])
+                        .status()
+                        .unwrap()
+                        .success()
+                };
+                assert!(
+                    open_in_child(true),
+                    "control: descriptor must survive exec before marking"
+                );
+                mark();
+                assert!(open_in_child(false), "descriptor leaked through exec");
+                assert_eq!(libc::close(fd), 0);
+                exit(0);
+            })
+        };
+        let (_, status) = child.wait(WaitOptions::new()).unwrap();
+        assert_eq!(status.exit_status(), Some(0));
+    }
+
+    #[test]
+    fn cloexec_prevents_descriptor_inheritance() {
+        check_descriptor_inheritance(|| super::mark_fds_as_cloexec().unwrap());
+    }
+
+    #[test]
+    fn fd_directory_fallback_prevents_descriptor_inheritance() {
+        check_descriptor_inheritance(|| super::cloexec_via_fd_dir(3, super::FD_DIR).unwrap());
     }
 
     #[test]
