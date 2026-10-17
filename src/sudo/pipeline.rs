@@ -23,6 +23,18 @@ pub(super) use list::run_list;
 mod edit;
 pub(super) use edit::run_edit;
 
+/// Refuse an AppArmor profile that this build could never apply.
+///
+/// The parser accepts `APPARMOR_PROFILE=` and `Defaults apparmor_profile`
+/// everywhere, because a single sudoers file is often shared between hosts.
+/// Only a profile selected by the rule that matched this command matters here:
+/// running that command unconfined would quietly ignore the confinement the
+/// policy asked for.
+fn ensure_apparmor_profile_supported(controls: &crate::sudoers::Restrictions) -> Result<(), Error> {
+    crate::apparmor::ensure_profile_supported(controls.apparmor_profile.as_deref())
+        .map_err(|err| Error::AppArmor(controls.apparmor_profile.clone().unwrap_or_default(), err))
+}
+
 fn read_sudoers() -> Result<Sudoers, Error> {
     let sudoers_path = &super::candidate_sudoers_file();
 
@@ -84,6 +96,10 @@ pub fn run(mut cmd_opts: SudoRunOptions) -> Result<(), Error> {
         return Err(Error::Authorization(context.current_user.name.to_string()));
     };
 
+    // Refuse a profile this build cannot apply before authenticating, so that a
+    // policy asking for confinement never reaches an unconfined command.
+    ensure_apparmor_profile_supported(&controls)?;
+
     let mut pam_context = auth_and_update_record_file(&context, auth)?;
 
     // build environment
@@ -107,7 +123,7 @@ pub fn run(mut cmd_opts: SudoRunOptions) -> Result<(), Error> {
     environment::dangerous_extend(&mut target_env, trusted_vars);
 
     // prepare switch of apparmor profile
-    #[cfg(feature = "apparmor")]
+    #[cfg(all(feature = "apparmor", target_os = "linux"))]
     if let Some(profile) = &controls.apparmor_profile {
         crate::apparmor::set_profile_for_next_exec(profile)
             .map_err(|err| Error::AppArmor(profile.clone(), err))?;

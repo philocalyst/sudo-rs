@@ -328,7 +328,6 @@ fn permission_test() {
     pass!(["ALL ALL=/foo/command --bar=1"], "user" => request! { root, root }, "server"; "/foo/command --bar=1");
 
     // apparmor
-    #[cfg(feature = "apparmor")]
     pass!(["ALL ALL=(ALL:ALL) APPARMOR_PROFILE=unconfined ALL"], "user" => root(), "server"; "/bin/bar" => [apparmor_profile: Some("unconfined".to_string())]);
 
     // list
@@ -377,6 +376,128 @@ fn default_bool_test() {
     assert!(sudoers.settings.env_keep().is_empty());
     assert_eq!(sudoers.settings.secure_path(), None);
     assert!(!sudoers.settings.env_editor());
+}
+
+#[test]
+fn apparmor_profile_is_selected_per_rule() {
+    // A profile this build cannot apply is refused rather than ignored, so it
+    // matters exactly which rule contributes one: a sudoers file shared across
+    // hosts may confine commands that this invocation never matches.
+    macro_rules! selected {
+        ([$($sudo:expr),*], $command:expr) => {{
+            let (Sudoers { rules, aliases, settings, customisers }, _) =
+                analyze(Path::new("/etc/fakesudoers"), sudoer![$($sudo),*]);
+            let cmdvec = $command
+                .split_whitespace()
+                .map(OsString::from)
+                .collect::<Vec<_>>();
+            let path = crate::common::resolve::canonicalize(&cmdvec[0])
+                .unwrap_or_else(|_| cmdvec[0].clone().into());
+            let request = Request {
+                user: &Named("root"),
+                group: &Named("root"),
+                command: &path,
+                arguments: &cmdvec[1..].to_vec(),
+            };
+            let judgement = Sudoers { rules, aliases, settings, customisers }
+                .check(&Named("user"), &system::Hostname::fake("server"), request);
+            match judgement.authorization() {
+                Authorization::Allowed(_, restrictions) => Some(restrictions.apparmor_profile),
+                Authorization::Forbidden => None,
+            }
+        }};
+    }
+
+    let profile = |p: &str| Some(Some(p.to_owned()));
+
+    // A tag on the matching rule.
+    assert_eq!(
+        selected!(
+            ["user ALL=(ALL:ALL) APPARMOR_PROFILE=confined /bin/foo"],
+            "/bin/foo"
+        ),
+        profile("confined")
+    );
+    // A global default applies to a rule that does not override it.
+    assert_eq!(
+        selected!(
+            [
+                "Defaults apparmor_profile=global",
+                "user ALL=(ALL:ALL) /bin/foo"
+            ],
+            "/bin/foo"
+        ),
+        profile("global")
+    );
+    // A tag wins over the default.
+    assert_eq!(
+        selected!(
+            [
+                "Defaults apparmor_profile=global",
+                "user ALL=(ALL:ALL) APPARMOR_PROFILE=specific /bin/foo"
+            ],
+            "/bin/foo"
+        ),
+        profile("specific")
+    );
+    // Unsetting the default leaves the command unconfined.
+    assert_eq!(
+        selected!(
+            [
+                "Defaults apparmor_profile=global",
+                "Defaults !apparmor_profile",
+                "user ALL=(ALL:ALL) /bin/foo"
+            ],
+            "/bin/foo"
+        ),
+        Some(None)
+    );
+    // A profile on a rule that did not match must not leak into this command.
+    assert_eq!(
+        selected!(
+            [
+                "user ALL=(ALL:ALL) APPARMOR_PROFILE=confined /bin/other",
+                "user ALL=(ALL:ALL) /bin/foo"
+            ],
+            "/bin/foo"
+        ),
+        Some(None)
+    );
+    // Within one rule a tag carries forward to later commands until replaced.
+    assert_eq!(
+        selected!(
+            ["user ALL=(ALL:ALL) APPARMOR_PROFILE=first /bin/one, /bin/two"],
+            "/bin/two"
+        ),
+        profile("first")
+    );
+    // Two rules match: the later one decides, both when it adds confinement
+    // and when it takes it away.
+    assert_eq!(
+        selected!(
+            [
+                "user ALL=(ALL:ALL) /bin/foo",
+                "user ALL=(ALL:ALL) APPARMOR_PROFILE=last /bin/foo"
+            ],
+            "/bin/foo"
+        ),
+        profile("last")
+    );
+    assert_eq!(
+        selected!(
+            [
+                "user ALL=(ALL:ALL) APPARMOR_PROFILE=first /bin/foo",
+                "user ALL=(ALL:ALL) /bin/foo"
+            ],
+            "/bin/foo"
+        ),
+        Some(None)
+    );
+    // A policy with no confinement anywhere stays unconfined.
+    assert_eq!(
+        selected!(["user ALL=(ALL:ALL) /bin/foo"], "/bin/foo"),
+        Some(None)
+    );
 }
 
 #[test]

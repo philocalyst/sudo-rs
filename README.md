@@ -236,6 +236,12 @@ cargo build --release --features apparmor
 
 This feature is disabled on our pre-supplied binaries.
 
+A profile selected by the matching sudoers rule is mandatory. The command is
+refused if the build or platform does not support AppArmor, or if AppArmor is
+disabled in the running kernel. A profile on an unmatched rule has no effect.
+`sudoedit` currently refuses any selected AppArmor profile because its editor
+pipeline cannot enforce that restriction.
+
 #### --features gettext
 
 sudo-rs has support for translated user-facing messages. To enable this feature,

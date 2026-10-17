@@ -1,5 +1,6 @@
 #![cfg(test)]
 
+mod apparmor;
 mod pty;
 mod regression;
 mod su;
