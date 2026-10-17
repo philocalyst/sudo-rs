@@ -326,7 +326,7 @@ mod tests {
 
         let path = PathBuf::from(OsString::from_vec(pty.path.into_bytes()));
         assert!(path.try_exists().unwrap());
-        assert!(path.starts_with("/dev/pts/"));
+        assert_eq!(path.as_os_str(), pty.follower.file.ttyname().unwrap());
     }
 
     #[test]

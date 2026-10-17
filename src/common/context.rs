@@ -295,7 +295,11 @@ impl Context {
 
 #[cfg(test)]
 mod tests {
-    use crate::{common::resolve::CurrentUser, sudo::SudoAction, system::Hostname};
+    use crate::{
+        common::resolve::{CurrentUser, canonicalize},
+        sudo::SudoAction,
+        system::Hostname,
+    };
 
     use super::Context;
 
@@ -312,12 +316,10 @@ mod tests {
 
         let context = Context::from_run_opts(options, &mut Default::default()).unwrap();
 
-        if cfg!(target_os = "linux") {
-            // this assumes /bin is a symlink on /usr/bin, like it is on modern Debian/Ubuntu
-            assert_eq!(context.command.command.to_str().unwrap(), "/usr/bin/echo");
-        } else {
-            assert_eq!(context.command.command.to_str().unwrap(), "/bin/echo");
-        }
+        // where echo is found depends on PATH, but it must be found through resolved directories
+        let command = &context.command.command;
+        assert_eq!(command.file_name().unwrap(), "echo");
+        assert_eq!(*command, canonicalize(command).unwrap());
         assert_eq!(context.command.arguments, ["hello"]);
         assert_eq!(context.hostname, Hostname::resolve());
         assert_eq!(context.target_user.uid, current_user.uid);

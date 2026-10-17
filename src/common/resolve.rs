@@ -339,38 +339,28 @@ pub fn canonicalize_newfile<P: AsRef<Path>>(path: P) -> io::Result<PathBuf> {
 #[cfg(test)]
 mod test {
     use super::canonicalize;
-    use std::path::Path;
+    use std::{fs, os::unix::fs::symlink, path::Path};
 
     #[test]
     fn canonicalization() {
         assert_eq!(canonicalize("/").unwrap(), Path::new("/"));
         assert!(canonicalize("").is_err());
-        if cfg!(any(target_os = "linux")) {
-            // this test REQUIRES /usr/bin/unxz to be a symlink for /usr/bin/xz or /usr/bin/busybox
-            assert!(Path::new("/bin").is_symlink());
-            assert!(Path::new("/usr/bin/unxz").is_symlink());
-            assert_eq!(
-                canonicalize("/usr/bin/unxz").unwrap(),
-                Path::new("/usr/bin/unxz")
-            );
-            // this assumes /bin is a symlink on /usr/bin, like it is on modern Debian/Ubuntu
-            assert_eq!(
-                canonicalize("/bin/unxz").unwrap(),
-                Path::new("/usr/bin/unxz")
-            );
-        } else if cfg!(target_os = "freebsd") {
-            // this test REQUIRES /usr/bin/pkill to be a symlink
-            assert!(Path::new("/usr/bin/pkill").is_symlink());
-            assert_eq!(
-                canonicalize("/usr/bin/pkill").unwrap(),
-                Path::new("/usr/bin/pkill")
-            );
-            assert_eq!(canonicalize("/bin/pkill").unwrap(), Path::new("/bin/pkill"));
-        } else {
-            panic!(
-                "canonicalization test not yet adapted for {}",
-                std::env::consts::OS
-            );
-        }
+
+        // symbolic links to directories are resolved, but not one in the last component
+        let dir = crate::system::file::create_temporary_dir().unwrap();
+        fs::create_dir(dir.join("real")).unwrap();
+        fs::write(dir.join("real/file"), "").unwrap();
+        symlink("file", dir.join("real/link")).unwrap();
+        symlink("real", dir.join("alias")).unwrap();
+
+        let through_alias = canonicalize(dir.join("alias/link"));
+        let direct = canonicalize(dir.join("real/link"));
+        let missing = canonicalize(dir.join("alias/missing"));
+        let real = fs::canonicalize(&dir).unwrap().join("real");
+        fs::remove_dir_all(&dir).unwrap();
+
+        assert_eq!(through_alias.unwrap(), real.join("link"));
+        assert_eq!(direct.unwrap(), real.join("link"));
+        assert!(missing.is_err());
     }
 }
