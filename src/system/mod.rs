@@ -1,6 +1,6 @@
 use std::{
     ffi::{CStr, c_int, c_long},
-    fmt, fs, io,
+    fmt, io,
     mem::MaybeUninit,
     ops,
     os::unix,
@@ -78,9 +78,10 @@ pub(crate) fn mark_fds_as_cloexec() -> io::Result<()> {
 }
 
 /// List the file descriptors in a directory such as /proc/self/fd.
+#[cfg(not(target_os = "macos"))]
 fn fds_listed_in(dir: &str) -> io::Result<Vec<c_int>> {
     let mut fds = Vec::new();
-    for entry in fs::read_dir(dir)? {
+    for entry in std::fs::read_dir(dir)? {
         let entry = entry?;
         let file_name = entry.file_name();
         let file_name = file_name.to_str().ok_or(io::Error::new(
@@ -732,7 +733,7 @@ mod tests {
         ffi::c_char,
         io::{self, Read, Write},
         os::{
-            fd::{AsFd, AsRawFd},
+            fd::{AsFd, AsRawFd, BorrowedFd},
             unix::net::UnixStream,
         },
         process::exit,
@@ -928,10 +929,19 @@ mod tests {
                 ))
                 .unwrap();
                 assert!(!is_cloexec(&should_close));
+                // a descriptor well past the others, which a partial listing would miss
+                let sparse = crate::cutils::cerr(libc::fcntl(
+                    should_close.as_fd().as_raw_fd(),
+                    libc::F_DUPFD,
+                    200,
+                ))
+                .unwrap();
+                assert!(!is_cloexec(&BorrowedFd::borrow_raw(sparse)));
 
                 super::mark_fds_as_cloexec().unwrap();
 
                 assert!(is_cloexec(&should_close));
+                assert!(is_cloexec(&BorrowedFd::borrow_raw(sparse)));
 
                 assert!(!is_cloexec(&io::stdin()));
                 assert!(!is_cloexec(&io::stdout()));

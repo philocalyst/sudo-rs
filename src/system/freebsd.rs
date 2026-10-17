@@ -27,7 +27,7 @@ pub(super) fn close_range_cloexec(lowfd: c_int) -> io::Result<()> {
 
 /// List the open file descriptors of the current process.
 pub(super) fn open_fds() -> io::Result<Vec<c_int>> {
-    super::fds_listed_in("/dev/fd")
+    super::fds_listed_in("/proc/self/fd")
 }
 
 fn get_proc_info(pid: WithProcess) -> std::io::Result<libc::kinfo_proc> {
