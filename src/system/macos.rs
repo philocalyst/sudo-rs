@@ -282,7 +282,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires administrator authentication; util/test-macos-native.sh runs this explicitly"]
+    #[ignore = "requires root; run through a Cargo runner as described in docs/macos.md"]
     fn privileged_credentials_round_trip() {
         use super::super::{
             _exit as exit, User, audit,
@@ -297,7 +297,10 @@ mod tests {
         };
         // SAFETY: querying effective uid cannot fail or cause memory unsafety.
         let effective_uid = unsafe { libc::geteuid() };
-        assert_eq!(effective_uid, 0, "run through the native macOS test script");
+        assert_eq!(
+            effective_uid, 0,
+            "run through a Cargo runner, see docs/macos.md"
+        );
         let name =
             CString::new(std::env::var("SUDO_RS_TEST_USER").expect("missing invoking account"))
                 .unwrap();

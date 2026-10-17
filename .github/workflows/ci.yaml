@@ -184,7 +184,13 @@ jobs:
           grep -r '#\[ignore' ./src | grep -v -e '"gh' -e '"wontfix"' && echo 'found ignored tests not linked to a GitHub issue. please like them using the format #[ignore = "gh123"]' && exit 1; true
 
   build-and-test:
-    runs-on: ubuntu-latest
+    runs-on: "${{ matrix.os }}"
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+          - os: macos-latest
 
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -192,17 +198,21 @@ jobs:
           persist-credentials: false
 
       - name: Correct permissions
+        if: matrix.os == 'ubuntu-latest'
         run: sudo chmod -R 755 /usr/share
 
       - name: Install llvm-tools component
+        if: matrix.os == 'ubuntu-latest'
         run: rustup component add llvm-tools
 
       - name: Add cargo-llvm-cov
+        if: matrix.os == 'ubuntu-latest'
         uses: taiki-e/install-action@9983c65e42da123ff25d1f78505eb6de315aa172 # v2.87.20
         with:
           tool: cargo-llvm-cov
 
       - name: Install dependencies
+        if: matrix.os == 'ubuntu-latest'
         run: |
           sudo apt update
           sudo apt install libpam0g-dev
@@ -215,6 +225,38 @@ jobs:
 
       - name: Run tests
         run: cargo test --workspace --all-targets --release
+
+      - name: Lint macOS platform code
+        if: matrix.os == 'macos-latest'
+        run: cargo clippy --workspace --all-targets -- --deny warnings
+
+      - name: Check optional macOS features
+        if: matrix.os == 'macos-latest'
+        run: cargo check --all-targets --features pam-login,unstable-remote-sudoers
+
+      - name: Check compliance harness on macOS
+        if: matrix.os == 'macos-latest'
+        working-directory: test-framework
+        run: |
+          cargo check --workspace --all-targets
+          cargo test -p sudo-test guest_dockerfiles_exist_for_the_host_backend
+
+      # The runner's account has passwordless sudo. `script` provides the
+      # controlling terminal that the window-size and job-control tests need.
+      - name: Native macOS privilege integration
+        if: matrix.os == 'macos-latest'
+        env:
+          SUDO_RS_NATIVE_NONINTERACTIVE: "1"
+        run: /usr/bin/script -q -e /dev/null cargo test --release --test macos_native -- --ignored --test-threads=1
+
+      # Cargo runs the test binary through the runner, here as root.
+      - name: Native macOS credential round trip
+        if: matrix.os == 'macos-latest'
+        run: |
+          host=$(rustc -vV | sed -n 's/^host: //p')
+          runner="CARGO_TARGET_$(echo "$host" | tr 'a-z-' 'A-Z_')_RUNNER"
+          env "$runner=sudo -n env SUDO_RS_TEST_USER=$(id -un)" \
+            cargo test --release --lib -- --ignored --exact system::macos::tests::privileged_credentials_round_trip
 
   build-and-test-minimal:
     runs-on: ubuntu-latest
