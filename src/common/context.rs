@@ -312,12 +312,16 @@ mod tests {
 
         let context = Context::from_run_opts(options, &mut Default::default()).unwrap();
 
-        if cfg!(target_os = "linux") {
-            // this assumes /bin is a symlink on /usr/bin, like it is on modern Debian/Ubuntu
-            assert_eq!(context.command.command.to_str().unwrap(), "/usr/bin/echo");
-        } else {
-            assert_eq!(context.command.command.to_str().unwrap(), "/bin/echo");
-        }
+        // `echo` is looked up on PATH; which directory wins differs per
+        // platform and per distribution, so assert the properties instead.
+        let command = &context.command.command;
+        assert!(command.is_absolute(), "{command:?} is not absolute");
+        assert_eq!(command.file_name(), Some(std::ffi::OsStr::new("echo")));
+        assert!(command.exists(), "{command:?} does not exist");
+        assert_eq!(
+            command,
+            &crate::common::resolve::canonicalize(command).unwrap()
+        );
         assert_eq!(context.command.arguments, ["hello"]);
         assert_eq!(context.hostname, Hostname::resolve());
         assert_eq!(context.target_user.uid, current_user.uid);

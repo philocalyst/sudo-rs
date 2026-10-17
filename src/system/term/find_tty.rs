@@ -56,3 +56,34 @@ fn find_tty_in_dir(dir: &Path, tty_dev: DeviceId) -> Option<OsString> {
 
     None
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::system::{
+        fork_for_test, setsid,
+        term::Pty,
+        wait::{Wait, WaitOptions},
+    };
+
+    #[test]
+    fn finds_the_actual_controlling_terminal() {
+        // SAFETY: the test helper contains any panic and only the child changes session.
+        let child = unsafe {
+            fork_for_test(|| {
+                setsid().unwrap();
+                let pty = Pty::open().unwrap();
+                pty.follower.make_controlling_terminal().unwrap();
+                let found = ttyname_from_dev().unwrap().unwrap();
+                let expected = pty.follower.ttyname().unwrap();
+                assert_eq!(
+                    fs::metadata(&found).unwrap().rdev(),
+                    fs::metadata(&expected).unwrap().rdev()
+                );
+                crate::system::_exit(0);
+            })
+        };
+        let (_, status) = child.wait(WaitOptions::new()).unwrap();
+        assert_eq!(status.exit_status(), Some(0), "{status:?}");
+    }
+}
