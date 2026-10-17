@@ -89,6 +89,12 @@ fn erase_feedback(sink: &mut dyn io::Write, i: usize) {
             return;
         }
     }
+
+    // Erase everyting after the cursor to make sure we don't leak the password
+    // size through the amount of spaces that are shown if you select the line
+    // containing the password in your terminal emulator.
+    // CSI n K: Erase in Line, 0 = erase from cursor to end of line
+    let _ = sink.write(b"\x1b[0K");
 }
 
 #[derive(Clone)]
@@ -155,6 +161,11 @@ fn prompt_password(
             }
         }
 
+        // If there was a prompt, write a new line to move the cursor to the start
+        if !prompt.is_empty() {
+            let _ = write_unbuffered(sink, b"\n");
+        }
+
         return res;
     }
 }
@@ -216,7 +227,6 @@ fn read_unbuffered(
     impl Drop for Bullets<'_> {
         fn drop(&mut self) {
             self.clear();
-            let _ = self.sink.write(b"\n");
         }
     }
 
@@ -310,11 +320,7 @@ impl<'a> TimeoutRead<'a> {
 
 impl TimeoutRead<'_> {
     fn read_byte(&mut self) -> io::Result<Option<u8>> {
-        #[cfg(any(target_os = "linux", target_os = "freebsd"))]
         let pollmask = libc::POLLIN | libc::POLLRDHUP;
-        #[cfg(target_os = "macos")]
-        // "POLLRDHUP is not supported on MacOS"
-        let pollmask = libc::POLLIN;
 
         let mut pollfd = [libc::pollfd {
             fd: self.fd.as_raw_fd(),
@@ -337,23 +343,17 @@ impl TimeoutRead<'_> {
             None => -1,
         };
 
-        if cfg!(miri) {
-            // Miri doesn't support poll: rust-lang/miri#4413
-            // FIXME(#1500) remove once miri supports it
-            pollfd[0].revents = libc::POLLIN;
-        } else {
-            // SAFETY: pollfd is initialized and its length matches
-            cerr(unsafe {
-                libc::poll(
-                    pollfd.as_mut_ptr(),
-                    pollfd.len().try_into().unwrap(),
-                    timeout,
-                )
-            })?;
-        }
+        // SAFETY: pollfd is initialized and its length matches
+        cerr(unsafe {
+            libc::poll(
+                pollfd.as_mut_ptr(),
+                pollfd.len().try_into().unwrap(),
+                timeout,
+            )
+        })?;
 
         // There may yet be data waiting to be read even if POLLHUP is set.
-        if pollfd[0].revents & (pollmask | libc::POLLHUP | libc::POLLNVAL) > 0 {
+        if pollfd[0].revents & (pollmask | libc::POLLHUP) > 0 {
             let mut buf = [0u8];
 
             // SAFETY: buf is initialized and its length matches
@@ -474,19 +474,12 @@ impl Terminal<'_> {
 mod test {
     use std::fs::File;
     use std::io::{Read, Write};
-    use std::os::fd::FromRawFd;
-
-    use libc::O_CLOEXEC;
 
     use super::*;
 
     fn make_pipe() -> (File, File) {
-        // SAFETY: A valid pointer to a mutable array of 2 fds is passed in.
-        unsafe {
-            let mut pipes = [-1, -1];
-            cerr(libc::pipe2(pipes.as_mut_ptr(), O_CLOEXEC)).unwrap();
-            (File::from_raw_fd(pipes[0]), File::from_raw_fd(pipes[1]))
-        }
+        let (rx, tx) = crate::cutils::pipe_cloexec().unwrap();
+        (rx.into(), tx.into())
     }
 
     #[test]
@@ -513,6 +506,30 @@ mod test {
         let mut data = vec![0; "hello world".len()];
         rx.read_exact(&mut data).unwrap();
         assert_eq!(data, b"hello world");
+    }
+
+    #[test]
+    fn empty_prompt_does_not_write_to_sink() {
+        let mut sink = Vec::new();
+        let (rx, mut tx) = make_pipe();
+        tx.write_all(b"password123\n").unwrap();
+        drop(tx);
+
+        prompt_password(rx.as_fd(), &mut sink, "", None, Hidden::No).unwrap();
+
+        assert!(sink.is_empty());
+    }
+
+    #[test]
+    fn displayed_prompt_ends_with_newline() {
+        let mut sink = Vec::new();
+        let (rx, mut tx) = make_pipe();
+        tx.write_all(b"password123\n").unwrap();
+        drop(tx);
+
+        prompt_password(rx.as_fd(), &mut sink, "Password: ", None, Hidden::No).unwrap();
+
+        assert_eq!(sink, b"Password: \n");
     }
 
     #[test]

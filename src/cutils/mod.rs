@@ -1,7 +1,7 @@
 use std::{
     ffi::{CStr, OsStr, OsString, c_char, c_int, c_long},
     os::{
-        fd::{AsRawFd, BorrowedFd},
+        fd::{AsRawFd, BorrowedFd, FromRawFd, OwnedFd},
         unix::prelude::OsStrExt,
     },
 };
@@ -109,39 +109,69 @@ pub fn is_fifo_or_sock(fildes: BorrowedFd) -> bool {
     fstat_mode_any::<{ libc::S_IFIFO | libc::S_IFSOCK }>(&fildes)
 }
 
-#[cfg(target_os = "macos")]
-/// # Safety the same as libc::pipe
-pub unsafe extern "C" fn pipe2(fds: *mut c_int, flags: c_int) -> c_int {
-    // SAFETY: the caller has to ensure this call is safe
-    unsafe {
-        if libc::pipe(fds) == -1 {
-            return -1;
+/// Dynamically obtain the correct buffer size (within bounds)
+pub fn dynamic_fill<T: Default + Copy, E>(
+    range: std::ops::Range<usize>,
+    mut fill: impl FnMut(&mut [T]) -> Result<Option<usize>, E>,
+) -> Result<Option<Vec<T>>, E> {
+    let mut buffer = vec![T::default(); range.start];
+    loop {
+        match fill(&mut buffer)? {
+            Some(len) => {
+                buffer.resize_with(len, || {
+                    panic!("closure returned a buffer size that was larger than the input, this should not happen")
+                });
+
+                return Ok(Some(buffer));
+            }
+
+            None => {
+                if buffer.len() >= range.end {
+                    return Ok(None);
+                } else {
+                    buffer.resize_with(std::cmp::min(buffer.len() * 2, range.end), T::default)
+                }
+            }
         }
     }
+}
 
-    // SAFETY: this is safe due to the contract on fcntl(2)
-    let setflag = |fd| unsafe {
-        let flag = cerr(libc::fcntl(fd, libc::F_GETFL))?;
-        cerr(libc::fcntl(fd, libc::F_SETFL, flag | flags))
-    };
-
-    // SAFETY: the caller will have ensured fds points to two c_int's
+/// Create a pipe whose ends will not survive exec.
+pub fn pipe_cloexec() -> std::io::Result<(OwnedFd, OwnedFd)> {
+    let mut fds = [-1; 2];
+    // SAFETY: pipe2 receives space for exactly two descriptors.
     unsafe {
-        if setflag(*fds).is_err() || setflag(*fds.add(1)).is_err() {
-            let _ = libc::close(*fds);
-            let _ = libc::close(*fds.add(1));
-            return -1;
-        };
+        cerr(libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC))?;
     }
-
-    0
+    // SAFETY: a successful pipe2 call initialized two new, owned descriptors.
+    Ok(unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) })
 }
 
 #[allow(clippy::undocumented_unsafe_blocks)]
 #[cfg(test)]
 mod test {
 
-    use super::{os_string_from_ptr, string_from_ptr};
+    use super::{dynamic_fill, os_string_from_ptr, string_from_ptr};
+
+    #[test]
+    fn pipe_is_cloexec_and_transfers_data() {
+        use std::io::{Read, Write};
+        use std::os::fd::AsRawFd;
+        let (rx, tx) = super::pipe_cloexec().unwrap();
+        for fd in [&rx, &tx] {
+            let flags = super::cerr(unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_GETFD) }).unwrap();
+            assert_ne!(flags & libc::FD_CLOEXEC, 0);
+            let flags = super::cerr(unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_GETFL) }).unwrap();
+            assert_eq!(flags & libc::O_NONBLOCK, 0);
+        }
+        let mut rx = std::fs::File::from(rx);
+        let mut tx = std::fs::File::from(tx);
+        tx.write_all(b"pipe data").unwrap();
+        drop(tx);
+        let mut data = Vec::new();
+        rx.read_to_end(&mut data).unwrap();
+        assert_eq!(data, b"pipe data");
+    }
 
     #[test]
     fn miri_test_str_to_ptr() {
@@ -171,5 +201,47 @@ mod test {
         let pty = Pty::open().unwrap();
         assert!(super::safe_isatty(pty.leader.as_fd()));
         assert!(super::safe_isatty(pty.follower.as_fd()));
+    }
+
+    #[test]
+    fn test_dynamic_fill() {
+        assert_eq!(
+            dynamic_fill(1..50, |buf: &mut [u8]| Ok::<_, ()>({
+                assert!(buf.len() < 50);
+                (buf.len() >= 23).then_some(23)
+            }))
+            .unwrap()
+            .unwrap()
+            .len(),
+            23
+        );
+
+        assert_eq!(
+            dynamic_fill(1..50, |buf: &mut [u8]| Ok::<_, ()>({
+                assert!(buf.len() <= 50);
+                (buf.len() >= 50).then_some(23)
+            }))
+            .unwrap()
+            .unwrap()
+            .len(),
+            23
+        );
+
+        assert!(
+            dynamic_fill(1..50, |buf: &mut [u8]| Ok::<_, ()>({
+                assert!(buf.len() <= 50);
+                None
+            }))
+            .unwrap()
+            .is_none()
+        );
+
+        assert!(
+            dynamic_fill(1..50, |buf: &mut [u8]| {
+                assert!(buf.len() == 1);
+                Err(())
+            })
+            .is_err()
+        );
     }
 }

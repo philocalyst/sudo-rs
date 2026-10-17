@@ -11,9 +11,13 @@ pub fn run_edit(edit_opts: SudoEditOptions) -> Result<(), Error> {
 
     let policy = super::judge(policy, &context)?;
 
-    let Authorization::Allowed(auth, _controls) = policy.authorization() else {
+    let Authorization::Allowed(auth, controls) = policy.authorization() else {
         return Err(Error::Authorization(context.current_user.name.to_string()));
     };
+
+    // sudoedit runs the editor without applying a profile, so a policy that
+    // selects one is refused rather than silently edited unconfined.
+    super::ensure_apparmor_profile_supported(&controls)?;
 
     let mut pam_context = super::auth_and_update_record_file(&context, auth)?;
 
@@ -54,7 +58,7 @@ pub fn run_edit(edit_opts: SudoEditOptions) -> Result<(), Error> {
 
     // run command and return corresponding exit code
     let command_exit_reason = {
-        super::log_command_execution(&context);
+        super::log_command_execution(controls.log, &context);
 
         let editor = policy.preferred_editor();
 

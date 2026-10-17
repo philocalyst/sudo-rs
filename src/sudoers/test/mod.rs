@@ -3,7 +3,7 @@ use std::ffi::CStr;
 use super::ast;
 use super::char_stream::CharStream;
 use super::*;
-use basic_parser::{parse_eval, parse_lines, parse_string};
+use basic_parser::{Status, parse_eval, parse_lines, parse_string};
 
 impl<T> Qualified<T> {
     pub fn as_allow(&self) -> Option<&T> {
@@ -214,6 +214,7 @@ fn permission_test() {
     pass!(["user ALL=/bin/hello arg"], "user" => root(), "server"; "/bin/hello arg");
     pass!(["user ALL=/bin/hello  arg"], "user" => root(), "server"; "/bin/hello arg");
     pass!(["user ALL=/bin/hello arg"], "user" => root(), "server"; "/bin/hello  arg");
+    pass!(["user ALL=/bin/hello\targ"], "user" => root(), "server"; "/bin/hello arg");
     FAIL!(["user ALL=/bin/hello arg"], "user" => root(), "server"; "/bin/hello boo");
     // several test cases with globbing in the arguments are explicitly not supported by sudo-rs
     //pass!(["user ALL=/bin/hello a*g"], "user" => root(), "server"; "/bin/hello  aaaarg");
@@ -281,6 +282,13 @@ fn permission_test() {
     pass!(["user ALL=(root) NOPASSWD: /bin/ls, (sudo) /bin/ls, /bin/true"], "user" => request! { sudo }, "server"; "/bin/true");
 
     SYNTAX!(["User_Alias, marc ALL = ALL"]);
+    SYNTAX!(["Host_Alias CHROOT = server"]);
+    SYNTAX!(["User_Alias CWD = user1"]);
+    SYNTAX!(["User_Alias NOTAFTER = user1"]);
+    SYNTAX!(["Runas_Alias NOTBEFORE = root"]);
+    SYNTAX!(["Cmnd_Alias TIMEOUT = /bin/ls"]);
+    SYNTAX!(["User_Alias ROLE = sudouser"]);
+    SYNTAX!(["User_Alias TYPE = sudouser"]);
 
     pass!(["User_Alias FULLTIME=ALL,!marc","FULLTIME ALL=ALL"], "user" => root(), "server"; "/bin/bash");
     FAIL!(["User_Alias FULLTIME=ALL,!marc","FULLTIME ALL=ALL"], "marc" => root(), "server"; "/bin/bash");
@@ -320,12 +328,28 @@ fn permission_test() {
     pass!(["ALL ALL=/foo/command --bar=1"], "user" => request! { root, root }, "server"; "/foo/command --bar=1");
 
     // apparmor
-    #[cfg(feature = "apparmor")]
     pass!(["ALL ALL=(ALL:ALL) APPARMOR_PROFILE=unconfined ALL"], "user" => root(), "server"; "/bin/bar" => [apparmor_profile: Some("unconfined".to_string())]);
 
     // list
     pass!(["ALL ALL=(ALL:ALL) /bin/ls, list"], "user" => root(), "server"; "list");
     FAIL!(["ALL ALL=(ALL:ALL) ALL, !list"], "user" => root(), "server"; "list");
+
+    // line continuation
+    pass!(["user ALL=/bin/hello \\", "arg"], "user" => root(), "server"; "/bin/hello arg");
+    pass!(["user ALL=/bin/hello \\", "arg1 \\", "arg2"], "user" => root(), "server"; "/bin/hello arg1 arg2");
+    pass!(
+        ["user ALL=(root) NOPASSWD: /usr/bin/true \\", "arg1 \\", "arg2"],
+        "user" => root(), "server";
+        "/usr/bin/true arg1 arg2" => [authenticate: Authenticate::Nopasswd]
+    );
+    pass!(["user ALL=/bin/hello\\", "arg"], "user" => root(), "server"; "/bin/hello arg");
+    pass!(
+        ["user ALL=/bin/hello \\", "\\", "arg"],
+        "user" => root(), "server";
+        "/bin/hello arg"
+    );
+    SYNTAX!(["us\\\ner ALL=ALL"]);
+    SYNTAX!(["user ALL=/bin/hello\\"]);
 }
 
 #[test]
@@ -352,6 +376,128 @@ fn default_bool_test() {
     assert!(sudoers.settings.env_keep().is_empty());
     assert_eq!(sudoers.settings.secure_path(), None);
     assert!(!sudoers.settings.env_editor());
+}
+
+#[test]
+fn apparmor_profile_is_selected_per_rule() {
+    // A profile this build cannot apply is refused rather than ignored, so it
+    // matters exactly which rule contributes one: a sudoers file shared across
+    // hosts may confine commands that this invocation never matches.
+    macro_rules! selected {
+        ([$($sudo:expr),*], $command:expr) => {{
+            let (Sudoers { rules, aliases, settings, customisers }, _) =
+                analyze(Path::new("/etc/fakesudoers"), sudoer![$($sudo),*]);
+            let cmdvec = $command
+                .split_whitespace()
+                .map(OsString::from)
+                .collect::<Vec<_>>();
+            let path = crate::common::resolve::canonicalize(&cmdvec[0])
+                .unwrap_or_else(|_| cmdvec[0].clone().into());
+            let request = Request {
+                user: &Named("root"),
+                group: &Named("root"),
+                command: &path,
+                arguments: &cmdvec[1..].to_vec(),
+            };
+            let judgement = Sudoers { rules, aliases, settings, customisers }
+                .check(&Named("user"), &system::Hostname::fake("server"), request);
+            match judgement.authorization() {
+                Authorization::Allowed(_, restrictions) => Some(restrictions.apparmor_profile),
+                Authorization::Forbidden => None,
+            }
+        }};
+    }
+
+    let profile = |p: &str| Some(Some(p.to_owned()));
+
+    // A tag on the matching rule.
+    assert_eq!(
+        selected!(
+            ["user ALL=(ALL:ALL) APPARMOR_PROFILE=confined /bin/foo"],
+            "/bin/foo"
+        ),
+        profile("confined")
+    );
+    // A global default applies to a rule that does not override it.
+    assert_eq!(
+        selected!(
+            [
+                "Defaults apparmor_profile=global",
+                "user ALL=(ALL:ALL) /bin/foo"
+            ],
+            "/bin/foo"
+        ),
+        profile("global")
+    );
+    // A tag wins over the default.
+    assert_eq!(
+        selected!(
+            [
+                "Defaults apparmor_profile=global",
+                "user ALL=(ALL:ALL) APPARMOR_PROFILE=specific /bin/foo"
+            ],
+            "/bin/foo"
+        ),
+        profile("specific")
+    );
+    // Unsetting the default leaves the command unconfined.
+    assert_eq!(
+        selected!(
+            [
+                "Defaults apparmor_profile=global",
+                "Defaults !apparmor_profile",
+                "user ALL=(ALL:ALL) /bin/foo"
+            ],
+            "/bin/foo"
+        ),
+        Some(None)
+    );
+    // A profile on a rule that did not match must not leak into this command.
+    assert_eq!(
+        selected!(
+            [
+                "user ALL=(ALL:ALL) APPARMOR_PROFILE=confined /bin/other",
+                "user ALL=(ALL:ALL) /bin/foo"
+            ],
+            "/bin/foo"
+        ),
+        Some(None)
+    );
+    // Within one rule a tag carries forward to later commands until replaced.
+    assert_eq!(
+        selected!(
+            ["user ALL=(ALL:ALL) APPARMOR_PROFILE=first /bin/one, /bin/two"],
+            "/bin/two"
+        ),
+        profile("first")
+    );
+    // Two rules match: the later one decides, both when it adds confinement
+    // and when it takes it away.
+    assert_eq!(
+        selected!(
+            [
+                "user ALL=(ALL:ALL) /bin/foo",
+                "user ALL=(ALL:ALL) APPARMOR_PROFILE=last /bin/foo"
+            ],
+            "/bin/foo"
+        ),
+        profile("last")
+    );
+    assert_eq!(
+        selected!(
+            [
+                "user ALL=(ALL:ALL) APPARMOR_PROFILE=first /bin/foo",
+                "user ALL=(ALL:ALL) /bin/foo"
+            ],
+            "/bin/foo"
+        ),
+        Some(None)
+    );
+    // A policy with no confinement anywhere stays unconfined.
+    assert_eq!(
+        selected!(["user ALL=(ALL:ALL) /bin/foo"], "/bin/foo"),
+        Some(None)
+    );
 }
 
 #[test]
@@ -391,6 +537,10 @@ fn default_set_test() {
     assert!(parse_string::<Sudo>("Defaults verifypw = \"sometimes\"").is_err());
     assert!(parse_string::<Sudo>("Defaults verifypw = sometimes").is_err());
     assert!(parse_string::<Sudo>("Defaults verifypw = never").is_ok());
+
+    assert!(parse_string::<Sudo>("Defaults runcwd = *").is_ok());
+    assert!(parse_string::<Sudo>("Defaults runcwd = /usr/local").is_ok());
+    assert!(parse_string::<Sudo>("Defaults !runcwd").is_ok());
 }
 
 #[test]
@@ -570,13 +720,32 @@ fn nullbyte_regression() {
 }
 
 #[test]
-fn alias_all_regression() {
-    assert!(try_parse_line("User_Alias ALL = sudouser").is_none())
+fn reserved_alias_names_are_rejected_for_alias_definitions() {
+    for line in [
+        "User_Alias ALL = sudouser",
+        "User_Alias CWD = sudouser",
+        "Host_Alias CHROOT = server",
+        "Cmnd_Alias TIMEOUT = /bin/ls",
+        "Runas_Alias NOTBEFORE = root",
+        "User_Alias NOTAFTER = sudouser",
+    ] {
+        assert!(try_parse_line(line).is_none(), "{line}");
+    }
 }
 
 #[test]
 fn defaults_regression() {
     assert!(try_parse_line("Defaults .mymachine=ALL").is_none())
+}
+
+#[test]
+fn user_id_regression() {
+    assert!(parse_line("#499999999999 ALL=ALL").is_line_comment());
+    assert!(parse_line("#49999999999 ALL=ALL").is_line_comment());
+    assert!(try_parse_line("Defaults:#49999999999 use_pty").is_none());
+    assert!(try_parse_line("Defaults:#4999999999 use_pty").is_none());
+    assert!(parse_line("#1999999999 ALL=ALL").is_spec());
+    assert!(parse_line("Defaults:#1999999999 use_pty").is_decl());
 }
 
 #[test]
@@ -601,6 +770,18 @@ fn specific_defaults() {
     assert!(parse_line("Defaults>user!use_pty").is_decl());
     assert!(try_parse_line("Defaults >user!use_pty").is_none());
     assert!(try_parse_line("Defaults >user !use_pty").is_none());
+}
+
+#[test]
+fn defaults_hostname_shenanigans() {
+    assert!(parse_line("Defaults@ hostname use_pty").is_decl());
+    assert!(try_parse_line("Defaults@ # comment\n use_pty").is_none());
+    /* ogsudo also rejects the following, probably due to hack in the parser
+    not too dissimilar from ours -- but sudo-rs has no problems with these */
+    assert!(parse_line("Defaults@\\\nhost use_pty").is_decl());
+    assert!(parse_line("Defaults:\\\nuser use_pty").is_decl());
+    assert!(parse_line("Defaults>\\\nuser use_pty").is_decl());
+    assert!(parse_line("Defaults!\\\nCMD use_pty").is_decl());
 }
 
 #[test]
@@ -701,6 +882,71 @@ fn regression_check_recursion() {
     );
 
     assert!(!error.is_empty());
+}
+
+#[cfg(feature = "unstable-remote-sudoers")]
+fn assert_remote_failure(line: &str, expected_msg: &str) {
+    let [Err(Status::Fatal(_, msg)), ..] = &parse_lines::<Sudo>(&mut CharStream::new(line))[..]
+    else {
+        panic!("Expected Fatal error");
+    };
+
+    assert_eq!(msg, expected_msg);
+}
+
+#[cfg(feature = "unstable-remote-sudoers")]
+fn assert_remote(
+    line: &str,
+    expected_path: &str,
+    expected_user: Identifier,
+    expected_group: Option<Identifier>,
+) {
+    let result = parse_line(line);
+    let ast::Sudo::Remote(path, peer_spec, _) = result else {
+        panic!("Expected Sudo::Remote");
+    };
+
+    assert_eq!(path, expected_path);
+    assert_eq!(expected_user, peer_spec.user);
+    assert_eq!(expected_group, peer_spec.group);
+}
+
+#[test]
+#[cfg(feature = "unstable-remote-sudoers")]
+fn remote_parsing() {
+    assert_remote(
+        "@socket ( user1:group1) /var/run/fake-1.socket",
+        "/var/run/fake-1.socket",
+        Identifier::Name("user1".into()),
+        Some(Identifier::Name("group1".into())),
+    );
+
+    assert_remote(
+        "@socket (#2000: #2000) /var/run/fake-2.socket",
+        "/var/run/fake-2.socket",
+        Identifier::ID(2000),
+        Some(Identifier::ID(2000)),
+    );
+
+    assert_remote(
+        "@socket (user3:#3000) /var/run/fake-3.socket",
+        "/var/run/fake-3.socket",
+        Identifier::Name("user3".into()),
+        Some(Identifier::ID(3000)),
+    );
+
+    assert_remote(
+        "@socket (user4) /var/run/fake-4.socket",
+        "/var/run/fake-4.socket",
+        Identifier::Name("user4".into()),
+        None,
+    );
+
+    assert_remote_failure("@socket", "expected elem");
+    assert_remote_failure("@socket /path/socket.5", "expected elem");
+    assert_remote_failure("@socket () /var/run/fake-6.socket", "expected elem");
+    assert_remote_failure("@socket (:#7000) /var/run/fake-7.socket", "expected elem");
+    assert_remote_failure("@socket (:user8) /var/run/fake-8.socket", "expected elem");
 }
 
 fn test_topo_sort(n: usize) {

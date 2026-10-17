@@ -9,8 +9,11 @@ use crate::log::{auth_info, auth_warn};
 use crate::pam::PamContext;
 use crate::sudo::env::environment;
 use crate::sudo::pam::{InitPamArgs, attempt_authenticate, init_pam, pre_exec};
-use crate::sudoers::{AuthenticatingUser, Authentication, Authorization, Judgement, Sudoers};
-use crate::system::term::current_tty_name;
+use crate::sudoers::{
+    AuthenticatingUser, Authentication, AuthenticationScope, Authorization, Judgement, Logging,
+    Sudoers,
+};
+use crate::system::term::{current_tty_name, lock_tty};
 use crate::system::timestamp::{RecordScope, SessionRecordFile, TouchResult};
 use crate::system::{Process, escape_os_str_lossy};
 
@@ -19,6 +22,18 @@ pub(super) use list::run_list;
 
 mod edit;
 pub(super) use edit::run_edit;
+
+/// Refuse an AppArmor profile that this build could never apply.
+///
+/// The parser accepts `APPARMOR_PROFILE=` and `Defaults apparmor_profile`
+/// everywhere, because a single sudoers file is often shared between hosts.
+/// Only a profile selected by the rule that matched this command matters here:
+/// running that command unconfined would quietly ignore the confinement the
+/// policy asked for.
+fn ensure_apparmor_profile_supported(controls: &crate::sudoers::Restrictions) -> Result<(), Error> {
+    crate::apparmor::ensure_profile_supported(controls.apparmor_profile.as_deref())
+        .map_err(|err| Error::AppArmor(controls.apparmor_profile.clone().unwrap_or_default(), err))
+}
 
 fn read_sudoers() -> Result<Sudoers, Error> {
     let sudoers_path = &super::candidate_sudoers_file();
@@ -81,6 +96,10 @@ pub fn run(mut cmd_opts: SudoRunOptions) -> Result<(), Error> {
         return Err(Error::Authorization(context.current_user.name.to_string()));
     };
 
+    // Refuse a profile this build cannot apply before authenticating, so that a
+    // policy asking for confinement never reaches an unconfined command.
+    ensure_apparmor_profile_supported(&controls)?;
+
     let mut pam_context = auth_and_update_record_file(&context, auth)?;
 
     // build environment
@@ -104,7 +123,7 @@ pub fn run(mut cmd_opts: SudoRunOptions) -> Result<(), Error> {
     environment::dangerous_extend(&mut target_env, trusted_vars);
 
     // prepare switch of apparmor profile
-    #[cfg(feature = "apparmor")]
+    #[cfg(all(feature = "apparmor", target_os = "linux"))]
     if let Some(profile) = &controls.apparmor_profile {
         crate::apparmor::set_profile_for_next_exec(profile)
             .map_err(|err| Error::AppArmor(profile.clone(), err))?;
@@ -113,7 +132,7 @@ pub fn run(mut cmd_opts: SudoRunOptions) -> Result<(), Error> {
     let options = context.try_as_run_options(&controls)?;
 
     // Log after try_as_run_options to avoid logging if the command is not resolved
-    log_command_execution(&context);
+    log_command_execution(controls.log, &context);
 
     // run command and return corresponding exit code
     let command_exit_reason = crate::exec::run_command(options, target_env)
@@ -151,6 +170,7 @@ fn auth_and_update_record_file(
         ref credential,
         pwfeedback,
         noninteractive_auth,
+        scope,
     }: Authentication,
 ) -> Result<PamContext, Error> {
     let auth_user = match credential {
@@ -163,7 +183,18 @@ fn auth_and_update_record_file(
         }
     };
 
-    let scope = RecordScope::for_process(&Process::new());
+    // To prevent two sudo-rs instances asking for a password at the same time,
+    // we try to obtain a file lock on the TTY in certain cases.
+    let _guard = if context.non_interactive || context.stdin || context.askpass {
+        None
+    } else {
+        lock_tty()
+    };
+
+    let scope = match scope {
+        AuthenticationScope::Tty => RecordScope::for_tty(&Process::new()),
+        AuthenticationScope::PPid => RecordScope::for_ppid(&Process::new()),
+    };
     let mut auth_status = determine_auth_status(
         must_authenticate,
         context.use_session_records,
@@ -207,6 +238,8 @@ fn auth_and_update_record_file(
             }
         }
     }
+
+    pam_context.validate_account_or_change_auth_token()?;
 
     Ok(pam_context)
 }
@@ -263,7 +296,10 @@ impl AuthStatus {
     }
 }
 
-fn log_command_execution(context: &Context) {
+fn log_command_execution(log: Logging, context: &Context) {
+    if matches!(log, Logging::Disabled) {
+        return;
+    }
     let tty_info = if let Ok(tty_name) = current_tty_name() {
         format!("TTY={} ;", escape_os_str_lossy(&tty_name))
     } else {

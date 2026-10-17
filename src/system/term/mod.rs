@@ -13,7 +13,10 @@ use libc::{TIOCSWINSZ, ioctl, winsize};
 
 use crate::cutils::{cerr, is_fifo_or_sock, os_string_from_ptr, safe_isatty};
 
+use super::file::FileLock;
 use super::interface::ProcessId;
+
+mod find_tty;
 
 pub(crate) use user_term::UserTerm;
 
@@ -223,7 +226,7 @@ impl<F: AsFd> Terminal for F {
     fn make_controlling_terminal(&self) -> io::Result<()> {
         // SAFETY: this is a correct way to call the TIOCSCTTY ioctl, see:
         // https://www.man7.org/linux/man-pages/man2/TIOCNOTTY.2const.html
-        cerr(unsafe { libc::ioctl(self.as_fd().as_raw_fd(), libc::TIOCSCTTY as _, 0) })?;
+        cerr(unsafe { libc::ioctl(self.as_fd().as_raw_fd(), libc::TIOCSCTTY, 0) })?;
         Ok(())
     }
 
@@ -253,8 +256,36 @@ impl<F: AsFd> Terminal for F {
 }
 
 /// Try to get the path of the current TTY
-pub fn current_tty_name() -> io::Result<OsString> {
-    std::io::stdin().ttyname()
+pub(crate) fn current_tty_name() -> io::Result<OsString> {
+    if let Some(tty) = find_tty::ttyname_from_dev()? {
+        return Ok(tty);
+    }
+
+    io::stdin()
+        .ttyname()
+        .or_else(|_| io::stdout().ttyname())
+        .or_else(|_| io::stderr().ttyname())
+}
+
+#[expect(unused)]
+pub(crate) struct TtyGuard(File, FileLock);
+
+/// Lock the tty to prevent contention over who owns the password prompt
+pub(crate) fn lock_tty() -> Option<TtyGuard> {
+    // Prefer the real device: flock() on /dev/tty's single shared inode serializes all terminals.
+    let tty = match find_tty::ttyname_from_dev() {
+        Ok(Some(path)) => File::open(path),
+        _ => File::open("/dev/tty"),
+    }
+    .ok()?;
+    // og-sudo uses fcntl(F_SETLKW) instead of the flock() that FileLock::exclusive does.
+    // This does mean in the unlikely case that sudo-rs and og-sudo are used inside the
+    // same pipeline, they will still fight for access to the tty. Adding a separate lock
+    // implementation for the tty is probably not worth it and changing the timestamp code
+    // to use fcntl(F_SETLKW) is iffy as flock() is much better behaved.
+    let lock = FileLock::exclusive(&tty, false).ok()?;
+
+    Some(TtyGuard(tty, lock))
 }
 
 #[repr(transparent)]
@@ -282,10 +313,9 @@ mod tests {
         io::{Read, Write},
         os::unix::{net::UnixStream, prelude::OsStringExt},
         path::PathBuf,
-        process::exit,
     };
 
-    use crate::system::{fork_for_test, getpgid, setsid, term::*};
+    use crate::system::{_exit as exit, fork_for_test, getpgid, setsid, term::*};
 
     #[test]
     fn open_pty() {
@@ -295,7 +325,7 @@ mod tests {
 
         let path = PathBuf::from(OsString::from_vec(pty.path.into_bytes()));
         assert!(path.try_exists().unwrap());
-        assert!(path.starts_with("/dev/pts/"));
+        assert_eq!(pty.follower.ttyname().unwrap(), path.as_os_str());
     }
 
     #[test]
