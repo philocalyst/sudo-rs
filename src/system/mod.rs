@@ -1,8 +1,5 @@
-// TODO: remove unused attribute when system is cleaned up
-#[cfg(target_os = "linux")]
-use std::str::FromStr;
 use std::{
-    ffi::{CStr, c_int, c_long, c_uint},
+    ffi::{CStr, c_int, c_long},
     fmt, fs, io,
     mem::MaybeUninit,
     ops,
@@ -16,15 +13,17 @@ use crate::{
 };
 use interface::{DeviceId, GroupId, ProcessId, UserId};
 pub use libc::PATH_MAX;
-#[cfg(target_os = "macos")]
-use libc::STDERR_FILENO;
-#[cfg(not(target_os = "macos"))]
-use libc::{CLOSE_RANGE_CLOEXEC, EINVAL, ENOSYS, STDERR_FILENO};
+use libc::{EBADF, EINVAL, ENOSYS, STDERR_FILENO};
 use time::ProcessCreateTime;
 
 use self::signal::SignalNumber;
 
 pub(crate) mod audit;
+// what each operating system provides in its own way
+#[cfg_attr(target_os = "freebsd", path = "freebsd.rs")]
+#[cfg_attr(target_os = "linux", path = "linux.rs")]
+#[cfg_attr(target_os = "macos", path = "macos.rs")]
+mod os;
 // generalized traits for when we want to hide implementations
 pub mod interface;
 
@@ -41,7 +40,7 @@ pub mod term;
 pub mod wait;
 
 #[cfg(not(any(target_os = "freebsd", target_os = "linux", target_os = "macos")))]
-compile_error!("sudo-rs only works on Linux, FreeBSD and MacOS");
+compile_error!("sudo-rs only works on Linux, FreeBSD and macOS");
 
 pub(crate) fn _exit(status: c_int) -> ! {
     // SAFETY: this function is safe to call
@@ -49,56 +48,39 @@ pub(crate) fn _exit(status: c_int) -> ! {
 }
 
 /// Mark every file descriptor that is not one of the IO streams as CLOEXEC.
-#[cfg(not(target_os = "macos"))]
 pub(crate) fn mark_fds_as_cloexec() -> io::Result<()> {
     let lowfd = STDERR_FILENO + 1;
 
-    // SAFETY: this function is safe to call:
-    // - any errors while closing a specific fd will be effectively ignored
-    #[allow(clippy::diverging_sub_expression)]
-    let res = unsafe {
-        'a: {
-            #[cfg(not(target_os = "linux"))]
-            break 'a cerr(libc::close_range(
-                lowfd as c_uint,
-                c_uint::MAX,
-                CLOSE_RANGE_CLOEXEC as c_int,
-            ));
-            // on Linux, close_range was only added in glibc 2.34, and is not
-            // part of musl, so we go perform a straight syscall instead
-            #[cfg(target_os = "linux")]
-            break 'a cerr(libc::syscall(
-                libc::SYS_close_range,
-                lowfd as c_uint,
-                c_uint::MAX,
-                CLOSE_RANGE_CLOEXEC as c_uint,
-            ));
-        }
-    };
-
-    match res {
+    match os::close_range_cloexec(lowfd) {
         Err(err) if err.raw_os_error() == Some(ENOSYS) || err.raw_os_error() == Some(EINVAL) => {
-            mark_fds_as_cloexec_fallback(lowfd)
+            // The kernel doesn't support close_range or CLOSE_RANGE_CLOEXEC,
+            // fallback to marking each open file descriptor.
+            for fd in os::open_fds()? {
+                if fd < lowfd {
+                    continue;
+                }
+                // SAFETY: This only sets the CLOEXEC flag for the given fd. Nothing is
+                // going to need it after exec.
+                if let Err(err) = cerr(unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) })
+                {
+                    // A descriptor that has been closed since it was listed, like the one a
+                    // directory of descriptors was read through, cannot be inherited.
+                    if err.raw_os_error() != Some(EBADF) {
+                        return Err(err);
+                    }
+                }
+            }
+
+            Ok(())
         }
-        Err(err) => Err(err),
-        Ok(_) => Ok(()),
+        result => result,
     }
 }
 
-#[cfg(target_os = "macos")]
-pub(crate) fn mark_fds_as_cloexec() -> io::Result<()> {
-    mark_fds_as_cloexec_fallback(STDERR_FILENO + 1)
-}
-
-fn mark_fds_as_cloexec_fallback(lowfd: i32) -> io::Result<()> {
-    // If the kernel doesn't support close_range or CLOSE_RANGE_CLOEXEC,
-    // fallback to finding all open fds using /proc/self/fd or /dev/fd
-
-    for entry in fs::read_dir(if cfg!(target_os = "linux") {
-        "/proc/self/fd"
-    } else {
-        "/dev/fd"
-    })? {
+/// List the file descriptors in a directory such as /proc/self/fd.
+fn fds_listed_in(dir: &str) -> io::Result<Vec<c_int>> {
+    let mut fds = Vec::new();
+    for entry in fs::read_dir(dir)? {
         let entry = entry?;
         let file_name = entry.file_name();
         let file_name = file_name.to_str().ok_or(io::Error::new(
@@ -114,17 +96,10 @@ fn mark_fds_as_cloexec_fallback(lowfd: i32) -> io::Result<()> {
                 "procfs returned non-integer fd name",
             )
         })?;
-        if fd < lowfd {
-            continue;
-        }
-        // SAFETY: This only sets the CLOEXEC flag for the given fd. Nothing is
-        // going to need it after exec.
-        unsafe {
-            cerr(libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC))?;
-        }
+        fds.push(fd);
     }
 
-    Ok(())
+    Ok(fds)
 }
 
 pub(crate) enum ForkResult {
@@ -685,16 +660,6 @@ pub enum WithProcess {
     Other(ProcessId),
 }
 
-impl WithProcess {
-    #[cfg(target_os = "linux")]
-    fn to_proc_string(&self) -> String {
-        match self {
-            WithProcess::Current => "self".into(),
-            WithProcess::Other(pid) => pid.to_string(),
-        }
-    }
-}
-
 #[derive(Debug, Clone)]
 pub struct Process {
     pub parent_pid: Option<ProcessId>,
@@ -733,206 +698,14 @@ impl Process {
 
     /// Returns the device identifier of the TTY device that is currently
     /// attached to the given process
-    #[cfg(target_os = "linux")]
     pub fn tty_device_id(pid: WithProcess) -> std::io::Result<Option<DeviceId>> {
-        // device id of tty is displayed as a signed integer of 32 bits
-        let data: i32 = read_proc_stat(pid, 6 /* tty_nr */)?;
-        if data == 0 {
-            Ok(None)
-        } else {
-            // While the integer was displayed as signed in the proc stat file,
-            // we actually need to interpret the bits of that integer as an unsigned
-            // int. We convert via u32 because a direct conversion to DeviceId
-            // would use sign extension, which would result in a different bit
-            // representation
-            Ok(Some(DeviceId::new(data as u64)))
-        }
-    }
-
-    #[cfg(target_os = "freebsd")]
-    fn get_proc_info(pid: WithProcess) -> std::io::Result<libc::kinfo_proc> {
-        use std::ffi::c_void;
-        use std::ptr;
-
-        let mut ki_proc: Vec<libc::kinfo_proc> = Vec::with_capacity(1);
-
-        let pid = match pid {
-            WithProcess::Current => std::process::id() as i32,
-            WithProcess::Other(pid) => pid.inner(),
-        };
-
-        loop {
-            let mut size = ki_proc.capacity() * size_of::<libc::kinfo_proc>();
-            // SAFETY: KERN_PROC_PID only reads data into the ki_proc list. It
-            // does not write more than `size` bytes to the pointer.
-            match cerr(unsafe {
-                libc::sysctl(
-                    [
-                        libc::CTL_KERN,
-                        libc::KERN_PROC,
-                        libc::KERN_PROC_PID,
-                        pid,
-                        size_of::<libc::kinfo_proc>() as i32,
-                        1,
-                    ]
-                    .as_ptr(),
-                    4,
-                    ki_proc.as_mut_ptr().cast::<c_void>(),
-                    &mut size,
-                    ptr::null(),
-                    0,
-                )
-            }) {
-                Ok(_) => {
-                    assert!(size >= size_of::<libc::kinfo_proc>());
-                    // SAFETY: The above sysctl has initialized at least `size` bytes. We have
-                    // asserted that this is at least a single element.
-                    unsafe {
-                        ki_proc.set_len(1);
-                    }
-                    break;
-                }
-                Err(e) if e.raw_os_error() == Some(libc::ENOMEM) => {
-                    // Vector not big enough. Grow it by 10% and try again.
-                    ki_proc.reserve(ki_proc.capacity() + (ki_proc.capacity() + 9) / 10);
-                }
-                Err(e) => return Err(e),
-            }
-        }
-
-        Ok(ki_proc[0])
-    }
-
-    /// Returns the device identifier of the TTY device that is currently
-    /// attached to the given process
-    #[cfg(target_os = "freebsd")]
-    pub fn tty_device_id(pid: WithProcess) -> std::io::Result<Option<DeviceId>> {
-        let ki_proc = Self::get_proc_info(pid)?;
-
-        if ki_proc.ki_tdev == !0 {
-            Ok(None)
-        } else {
-            Ok(Some(DeviceId::new(ki_proc.ki_tdev)))
-        }
-    }
-
-    /// Returns the device identifier of the TTY device that is currently
-    /// attached to the given process
-    #[cfg(target_os = "macos")]
-    pub fn tty_device_id(pid: WithProcess) -> std::io::Result<Option<DeviceId>> {
-        Ok(None)
+        os::tty_device_id(pid)
     }
 
     /// Get the process starting time of a specific process
-    #[cfg(target_os = "linux")]
     pub fn starting_time(pid: WithProcess) -> io::Result<ProcessCreateTime> {
-        let process_start: u64 = read_proc_stat(pid, 21 /* start_time */)?;
-
-        // the startime field is stored in ticks since the system start, so we need to know how many
-        // ticks go into a second
-        let ticks_per_second = crate::cutils::sysconf(libc::_SC_CLK_TCK).ok_or_else(|| {
-            io::Error::other("Could not retrieve system config variable for ticks per second")
-        })? as u64;
-
-        // finally compute the system time at which the process was started
-        Ok(ProcessCreateTime::new(
-            (process_start / ticks_per_second) as i64,
-            ((process_start % ticks_per_second) * (1_000_000_000 / ticks_per_second)) as i64,
-        ))
+        os::starting_time(pid)
     }
-
-    /// Get the process starting time of a specific process
-    #[cfg(target_os = "freebsd")]
-    pub fn starting_time(pid: WithProcess) -> io::Result<ProcessCreateTime> {
-        let ki_proc = Self::get_proc_info(pid)?;
-
-        let ki_start = ki_proc.ki_start;
-        #[allow(clippy::useless_conversion)]
-        Ok(ProcessCreateTime::new(
-            i64::from(ki_start.tv_sec),
-            i64::from(ki_start.tv_usec) * 1000,
-        ))
-    }
-
-    /// Get the process starting time of a specific process
-    #[cfg(target_os = "macos")]
-    pub fn starting_time(pid: WithProcess) -> io::Result<ProcessCreateTime> {
-        Ok(ProcessCreateTime::new(0, 0))
-    }
-}
-
-/// Read the n-th field (with 0-based indexing) from `/proc/<pid>/self`.
-///
-/// See ["Table 1-4: Contents of the stat fields" of "The /proc
-/// Filesystem"][proc_stat_fields] in the Linux docs for all available fields.
-///
-/// IMPORTANT: the first two fields are not accessible with this routine.
-///
-/// [proc_stat_fields]: https://www.kernel.org/doc/html/latest/filesystems/proc.html#id10
-#[cfg(target_os = "linux")]
-fn read_proc_stat<T: FromStr>(pid: WithProcess, field_idx: isize) -> io::Result<T> {
-    // the first two fields are skipped by the code below, and we never need them,
-    // so no point in implementing code for it in this private function.
-    debug_assert!(field_idx >= 2);
-
-    // read from a specific pid file, or use `self` to refer to our own process
-    let pidref = pid.to_proc_string();
-
-    // read the data from the stat file for the process with the given pid
-    let path = PathBuf::from_iter(&["/proc", &pidref, "stat"]);
-    let proc_stat = std::fs::read(path)?;
-
-    // first get the part of the stat file past the second argument, we then reverse
-    // search for a ')' character and start the search for the starttime field from there on
-    let skip_past_second_arg = proc_stat.iter().rposition(|b| *b == b')').ok_or_else(|| {
-        io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "Could not find position of 'comm' field in process stat",
-        )
-    })?;
-    let mut stat = &proc_stat[skip_past_second_arg..];
-
-    // we've now passed the first two fields, so we are at index 1, now we skip over
-    // fields until we arrive at the field we are searching for
-    let mut curr_field = 1;
-    while curr_field < field_idx && !stat.is_empty() {
-        if stat[0] == b' ' {
-            curr_field += 1;
-        }
-        stat = &stat[1..];
-    }
-
-    // The expected field cannot be in the file anymore when we are at EOF
-    if stat.is_empty() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "Stat file was not of the expected format",
-        ));
-    }
-
-    // we've now arrived at the field we are looking for, we now check how
-    // long this field is by finding where the next space is
-    let mut idx = 0;
-    while stat[idx] != b' ' && idx < stat.len() {
-        idx += 1;
-    }
-    let field = &stat[0..idx];
-
-    // we first convert the data to a string slice, this should not fail with a normal /proc filesystem
-    let fielddata = std::str::from_utf8(field).map_err(|_| {
-        io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "Could not interpret byte slice as string",
-        )
-    })?;
-
-    // then we convert the string slice to whatever the requested type was
-    fielddata.parse().map_err(|_| {
-        io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "Could not interpret string as number",
-        )
-    })
 }
 
 pub fn escape_os_str_lossy(s: &std::ffi::OsStr) -> String {
@@ -1170,24 +943,5 @@ mod tests {
 
         let (_, status) = child_pid.wait(WaitOptions::new()).unwrap();
         assert_eq!(status.exit_status(), Some(0));
-    }
-
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn proc_stat_test() {
-        use super::{Process, WithProcess::Current, read_proc_stat};
-        // The process can be '(uninterruptible) sleeping' or 'running': it looks like the state
-        // field of /proc/pid/stat will show the state for the main thread of the process rather
-        // than for the process as a whole.
-        let state = read_proc_stat::<char>(Current, 2).unwrap();
-        assert!("SDR".contains(state), "{state} is not S, D or R");
-        let parent = Process::parent_id().unwrap();
-        // field 3 is always the parent process
-        assert_eq!(
-            parent,
-            ProcessId::new(read_proc_stat::<i32>(Current, 3).unwrap())
-        );
-        // this next field should always be 0 (which precedes an important bit of info for us!)
-        assert_eq!(0, read_proc_stat::<i32>(Current, 20).unwrap());
     }
 }
