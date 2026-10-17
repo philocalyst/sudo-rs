@@ -1,6 +1,7 @@
 #![cfg_attr(not(feature = "unstable-remote-sudoers"), allow(unused_imports))]
+#[cfg(test)]
 use std::collections::HashSet;
-use std::ffi::{CStr, CString, c_int, c_uint};
+use std::ffi::{CStr, CString, c_uint};
 use std::fs::{self, DirBuilder, File, Metadata, OpenOptions};
 use std::io::{self, BufReader, Error, ErrorKind};
 use std::net::Shutdown;
@@ -14,7 +15,8 @@ use std::os::unix::{
 use std::path::{Component, Path};
 
 use super::{
-    Group, GroupId, User, UserId, cerr, inject_group, interface::UnixUser, set_supplementary_groups,
+    Group, GroupId, User, UserId, cerr, inject_group, interface::UnixUser,
+    set_supplementary_groups, set_user_groups,
 };
 use crate::common::resolve::CurrentUser;
 
@@ -26,14 +28,12 @@ pub(crate) fn no_new_privs_enabled() -> io::Result<bool> {
     Ok(no_new_privs != 0)
 }
 
-/// Temporary change privileges --- essentially a 'mini sudo'
-/// This is only used for sudoedit.
+/// Temporarily change effective credentials for command resolution and sudoedit.
 pub(crate) fn sudo_call<T>(
     target_user: &User,
     target_group: &Group,
     operation: impl FnOnce() -> T,
 ) -> io::Result<T> {
-    const KEEP_UID: libc::uid_t = -1i32 as libc::uid_t;
     const KEEP_GID: libc::gid_t = -1i32 as libc::gid_t;
 
     // SAFETY: these libc functions are always safe to call
@@ -58,39 +58,80 @@ pub(crate) fn sudo_call<T>(
     let mut target_groups = target_user.groups.clone();
     inject_group(target_group.gid, &mut target_groups);
 
-    if cfg!(test)
-        && target_user.uid == cur_user_id
-        && target_group.gid == cur_group_id
-        && target_groups.iter().collect::<HashSet<_>>() == cur_groups.iter().collect::<HashSet<_>>()
+    #[cfg(test)]
     {
-        // we are not actually switching users, simply run the closure
-        // (this would also be safe in production mode, but it is a needless check)
-        return Ok(operation());
+        let same_groups = target_groups.iter().collect::<HashSet<_>>()
+            == cur_groups.iter().collect::<HashSet<_>>();
+        #[cfg(target_os = "macos")]
+        let same_groups = same_groups
+            || (target_user.groups_may_expand
+                && cur_groups.iter().all(|gid| target_groups.contains(gid)));
+        if target_user.uid == cur_user_id && target_group.gid == cur_group_id && same_groups {
+            // Tests can open files as themselves without privileged setgroups.
+            return Ok(operation());
+        }
     }
 
-    struct ResetUserGuard(UserId, GroupId, Vec<GroupId>);
+    // Restoring the invoking account's groups needs the account itself, because
+    // only `initgroups` keeps Open Directory membership resolution switched on.
+    // The current group list has to be one that account would be given, or
+    // `initgroups` would hand back a different set than it took away.
+    // A failure here stops before any credential has changed; guessing would
+    // leave the process pinned to a `setgroups` list for the rest of its life.
+    #[cfg(target_os = "macos")]
+    let restore_account = {
+        let mut account = User::real().map_err(|err| io::Error::other(err.to_string()))?;
+        if let Some(user) = &account {
+            for gid in &cur_groups {
+                if !super::macos::is_group_member(user.uid, *gid)? {
+                    account = None;
+                    break;
+                }
+            }
+        }
+        account
+    };
+
+    struct ResetUserGuard(
+        UserId,
+        GroupId,
+        Vec<GroupId>,
+        #[cfg(target_os = "macos")] Option<User>,
+    );
 
     impl Drop for ResetUserGuard {
         fn drop(&mut self) {
             // restore privileges in reverse order
             (|| {
                 // SAFETY: this function is always safe to call
-                cerr(unsafe { libc::setresuid(KEEP_UID, UserId::inner(&self.0), KEEP_UID) })?;
+                cerr(unsafe { libc::seteuid(UserId::inner(&self.0)) })?;
                 // SAFETY: this function is always safe to call
-                cerr(unsafe { libc::setresgid(KEEP_GID, GroupId::inner(&self.1), KEEP_GID) })?;
+                cerr(unsafe { libc::setegid(GroupId::inner(&self.1)) })?;
+                #[cfg(target_os = "macos")]
+                if let Some(user) = &self.3 {
+                    let mut groups = self.2.clone();
+                    inject_group(self.1, &mut groups);
+                    return set_user_groups(user, &groups);
+                }
                 set_supplementary_groups(&self.2)
             })()
             .expect("could not restore to saved user id");
         }
     }
 
-    let guard = ResetUserGuard(cur_user_id, cur_group_id, cur_groups);
+    let guard = ResetUserGuard(
+        cur_user_id,
+        cur_group_id,
+        cur_groups,
+        #[cfg(target_os = "macos")]
+        restore_account,
+    );
 
-    set_supplementary_groups(&target_groups)?;
+    set_user_groups(target_user, &target_groups)?;
     // SAFETY: this function is always safe to call
-    cerr(unsafe { libc::setresgid(KEEP_GID, GroupId::inner(&target_group.gid), KEEP_GID) })?;
+    cerr(unsafe { libc::setegid(GroupId::inner(&target_group.gid)) })?;
     // SAFETY: this function is always safe to call
-    cerr(unsafe { libc::setresuid(KEEP_UID, UserId::inner(&target_user.uid), KEEP_UID) })?;
+    cerr(unsafe { libc::seteuid(UserId::inner(&target_user.uid)) })?;
 
     let result = operation();
 
@@ -98,9 +139,9 @@ pub(crate) fn sudo_call<T>(
     Ok(result)
 }
 
-#[cfg(feature = "unstable-remote-sudoers")]
+#[cfg(all(feature = "unstable-remote-sudoers", target_os = "linux"))]
 /// Get the credentials of the peer at the other side of the socket
-fn get_peer_credentials(stream: &UnixStream) -> io::Result<libc::ucred> {
+fn get_peer_credentials(stream: &UnixStream) -> io::Result<(UserId, GroupId)> {
     let mut ucred = libc::ucred {
         pid: 0,
         uid: 0,
@@ -120,7 +161,15 @@ fn get_peer_credentials(stream: &UnixStream) -> io::Result<libc::ucred> {
         ))?;
     }
 
-    Ok(ucred)
+    Ok((UserId::new(ucred.uid), GroupId::new(ucred.gid)))
+}
+
+#[cfg(all(feature = "unstable-remote-sudoers", not(target_os = "linux")))]
+fn get_peer_credentials(stream: &UnixStream) -> io::Result<(UserId, GroupId)> {
+    let (mut uid, mut gid) = (0, 0);
+    // SAFETY: getpeereid receives two valid output pointers and a live socket.
+    cerr(unsafe { libc::getpeereid(stream.as_raw_fd(), &mut uid, &mut gid) })?;
+    Ok((UserId::new(uid), GroupId::new(gid)))
 }
 
 /// Drop root privileges by setting effective user id equal to the real user id.
@@ -312,9 +361,9 @@ fn secure_open_socket_impl(
 
     // If there is an error in these checks, the function returns immediately
     // leaving `stream` out of scope and forcing the closing of the socket.
-    check_peer(UserId::new(peer_creds.uid), user, "user")?;
+    check_peer(peer_creds.0, user, "user")?;
     if let Some(group) = group {
-        check_peer(GroupId::new(peer_creds.gid), group, "group")?;
+        check_peer(peer_creds.1, group, "group")?;
     }
 
     stream.shutdown(Shutdown::Write)?;
@@ -347,7 +396,13 @@ fn open_at(parent: BorrowedFd, file_name: &CStr, create: bool) -> io::Result<Own
     }
 }
 
-fn faccess_at(parent: BorrowedFd, path: &CStr, mode: c_int, flags: c_int) -> io::Result<()> {
+#[cfg(not(any(test, target_os = "macos")))]
+fn faccess_at(
+    parent: BorrowedFd,
+    path: &CStr,
+    mode: std::ffi::c_int,
+    flags: std::ffi::c_int,
+) -> io::Result<()> {
     // SAFETY: by design, a correct CStr pointer is passed to faccessat
     cerr(unsafe { libc::faccessat(parent.as_raw_fd(), path.as_ptr(), mode, flags) }).map(|_| ())
 }
@@ -403,6 +458,7 @@ fn traversed_secure_open(
 
     let user_cannot_write = |file: &File| -> io::Result<()> {
         let meta = file.metadata()?;
+        #[cfg(test)]
         let perms = meta.permissions().mode();
 
         if meta.uid() == forbidden_user.uid.inner() {
@@ -413,7 +469,8 @@ fn traversed_secure_open(
             ));
         }
 
-        let user_has_write_perms = if cfg!(test) {
+        #[cfg(test)]
+        let user_has_write_perms = {
             // During testing we do a less comprehensive check as we don't have
             // permission to set the real user id to arbitrary users, but faccessat
             // looks at the real user id.
@@ -422,7 +479,11 @@ fn traversed_secure_open(
                     && forbidden_user.in_group_by_gid(GroupId::new(meta.gid()))
                 || (perms & mode(Category::Owner, Op::Write) != 0)
                     && forbidden_user.uid.inner() == meta.uid()
-        } else {
+        };
+        #[cfg(all(not(test), target_os = "macos"))]
+        let user_has_write_perms = super::macos::real_user_can_write(file.as_fd(), forbidden_user)?;
+        #[cfg(not(any(test, target_os = "macos")))]
+        let user_has_write_perms = {
             // Only works when forbidden_user is current user. This is enforced
             // by accepting CurrentUser outside of test mode.
             // We don't pass AT_EACCESS to faccessat to make it check using the
@@ -474,6 +535,16 @@ fn traversed_secure_open(
 #[cfg(test)]
 mod test {
     use super::*;
+
+    #[cfg(feature = "unstable-remote-sudoers")]
+    #[test]
+    fn remote_socket_peer_credentials_match_the_process() {
+        let (socket, _peer) = UnixStream::pair().unwrap();
+        let (uid, gid) = get_peer_credentials(&socket).unwrap();
+        // SAFETY: these functions are always safe to call.
+        let expected = unsafe { (libc::geteuid(), libc::getegid()) };
+        assert_eq!((uid.inner(), gid.inner()), expected);
+    }
 
     #[test]
     fn secure_open_is_predictable() {
@@ -532,6 +603,7 @@ mod test {
 
         let user = CurrentUser::resolve().unwrap();
         let other_user = CurrentUser::fake(User {
+            groups_may_expand: false,
             uid: UserId::new(1042),
             gid: GroupId::new(1042),
 

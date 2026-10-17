@@ -34,6 +34,7 @@ defaults! {
     fqdn                      = false  #ignored
     ignore_dot                = true   #ignored
     lecture                   = never (!= never) [always, once, never] #ignored
+    lecture_file              = None (!= None) #ignored
     mailerpath                = None (!= None) #ignored
     mail_badpass              = true   #ignored
     match_group_by_gid        = false  #ignored

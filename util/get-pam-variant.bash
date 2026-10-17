@@ -8,6 +8,9 @@ Linux)
 FreeBSD)
     echo openpam
     ;;
+Darwin)
+    echo macos
+    ;;
 *)
     echo "Unsupported platform"
     exit 1

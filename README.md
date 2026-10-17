@@ -13,7 +13,9 @@ Suspected vulnerabilities can be reported on our [security page](https://github.
 
 Sudo-rs has been audited twice: an audit of version 0.2.0 was performed in August 2023, and a second audit of version 0.2.8 in August 2025. The audit reports can be found [here](docs/audit).
 
-Sudo-rs currently is targeted for FreeBSD and Linux-based operating systems only.
+Sudo-rs is targeted for Linux, FreeBSD and macOS.
+The macOS port is described in [the macOS guide](docs/macos.md), including its
+build requirements and native privilege integration tests.
 
 ## Installing sudo-rs
 

@@ -114,11 +114,11 @@ Trifecta Tech projects that are "re-implementations" typically respect the origi
 
 ## What operating systems does sudo-rs support?
 
-sudo-rs is fully supported for reasonably modern Linux systems, as well as on FreeBSD.
+sudo-rs is supported on reasonably modern Linux systems, as well as on FreeBSD and macOS. The [macOS guide](docs/macos.md) describes native integration, build requirements, and privilege tests.
 
-There are some small differences. For example, on FreeBSD, `NOEXEC:` is not supported (since it can't really be implemented with the same level of guarantees as on Linux). Our compliance testing framework comparing `sudo-rs` to `sudo` is also executed on both platforms.
+There are platform differences. `NOEXEC:` and AppArmor confinement can only be enforced on Linux. Where they cannot be enforced, a policy that asks for them is refused before the command runs, rather than running it unrestricted. The compliance framework compares `sudo-rs` to `sudo` on Linux and FreeBSD; when launched from macOS it exercises a Linux guest. Native macOS privilege and terminal behavior has a separate integration suite.
 
-In the future, we would also like to support MacOS and be able to say "of course it runs on NetBSD!", but right now we have prioritized other tasks. Patches are welcome!
+NetBSD is not currently supported. Patches are welcome!
 
 ## Why doesn't sudo-rs insult me when I mistype my password?
 
@@ -212,7 +212,7 @@ Furthermore, an information leak vulnerability was discovered by cybersecurity e
 
 ## Is there a reason to not switch to sudo-rs?
 
-Certainly. There are features that sudo-rs doesn't support (such as sending mail, storing the sudoers file in LDAP, matching commands using regular expressions). If you cannot upgrade your workflow to not need those features, you may need to stick with sudo. Also, original sudo is a highly portable program and runs a highly diverse set of operating systems. Sudo-rs is only available for Linux and FreeBSD.
+Certainly. There are features that sudo-rs doesn't support (such as sending mail, storing the sudoers file in LDAP, matching commands using regular expressions). If you cannot upgrade your workflow to not need those features, you may need to stick with sudo. Also, original sudo is a highly portable program and runs a highly diverse set of operating systems. Sudo-rs is available for Linux, FreeBSD and macOS; see the [macOS guide](docs/macos.md) for macOS details.
 
 There may also be socio-economic reasons. If you are operating in a highly conservative environment, that may also be a reason why you might prefer sudo: it has a lot of history behind it and is widely accepted. If you're the sysadmin that installed sudo on every workstation in your organization, you're unlikely to be blamed if a vulnerability is discovered.
 

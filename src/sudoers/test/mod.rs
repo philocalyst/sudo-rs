@@ -544,6 +544,22 @@ fn default_set_test() {
 }
 
 #[test]
+fn apple_lecture_file_default() {
+    // Apple's installed sudoers contains this setting. As with `lecture`,
+    // accept it without displaying a lecture, and keep parsing the policy.
+    let (_, diagnostics) = analyze(
+        Path::new("/etc/fakesudoers"),
+        sudoer![
+            "Defaults lecture_file = \"/etc/sudo_lecture\"",
+            "Defaults:user lecture_file = /etc/custom_lecture",
+            "Defaults !lecture_file",
+            "%admin ALL = (ALL) ALL"
+        ],
+    );
+    assert!(diagnostics.is_empty());
+}
+
+#[test]
 fn default_multi_test() {
     let (mut sudoers, _) = analyze(
         Path::new("/etc/fakesudoers"),

@@ -137,14 +137,25 @@ pub fn dynamic_fill<T: Default + Copy, E>(
 }
 
 /// Create a pipe whose ends will not survive exec.
+/// On macOS, creation and setting CLOEXEC are separate operations. As with the
+/// rest of the execution pipeline, callers must not concurrently fork/exec.
 pub fn pipe_cloexec() -> std::io::Result<(OwnedFd, OwnedFd)> {
     let mut fds = [-1; 2];
-    // SAFETY: pipe2 receives space for exactly two descriptors.
+    // SAFETY: both functions receive space for exactly two descriptors.
     unsafe {
+        #[cfg(target_os = "macos")]
+        cerr(libc::pipe(fds.as_mut_ptr()))?;
+        #[cfg(not(target_os = "macos"))]
         cerr(libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC))?;
     }
-    // SAFETY: a successful pipe2 call initialized two new, owned descriptors.
-    Ok(unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) })
+    // SAFETY: a successful pipe call initialized two new, owned descriptors.
+    let pair = unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) };
+    #[cfg(target_os = "macos")]
+    for fd in [&pair.0, &pair.1] {
+        // SAFETY: F_SETFD only changes flags on our newly created descriptor.
+        cerr(unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_SETFD, libc::FD_CLOEXEC) })?;
+    }
+    Ok(pair)
 }
 
 #[allow(clippy::undocumented_unsafe_blocks)]

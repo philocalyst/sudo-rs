@@ -5,7 +5,7 @@ use crate::{SUDOERS_NO_LECTURE, USERNAME};
 macro_rules! assert_snapshot {
     ($($tt:tt)*) => {
         insta::with_settings!({
-            filters => if cfg!(target_os = "linux") {
+            filters => if sudo_test::is_linux_guest() {
                 vec![(r"[[:xdigit:]]{12}", "[host]")]
             } else {
                 vec![

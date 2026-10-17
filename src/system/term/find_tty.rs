@@ -24,8 +24,11 @@ pub(super) fn ttyname_from_dev() -> io::Result<Option<OsString>> {
     }
 }
 
+#[allow(clippy::unnecessary_cast)] // dev_t is signed on Darwin and unsigned on Linux/FreeBSD.
 fn is_our_tty(metadata: fs::Metadata, tty_dev: DeviceId) -> bool {
-    metadata.file_type().is_char_device() && metadata.rdev() == tty_dev.inner()
+    // Compare in the native dev_t type: Darwin's signed device ids are exposed
+    // as sign-extended u64 values by MetadataExt.
+    metadata.file_type().is_char_device() && metadata.rdev() as libc::dev_t == tty_dev.inner()
 }
 
 fn ttyname_from_stdioe(tty_dev: DeviceId) -> Option<OsString> {

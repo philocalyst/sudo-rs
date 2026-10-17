@@ -6,7 +6,7 @@ use sudo_test::{Command, Env, User};
 
 use crate::{GROUPNAME, PASSWORD, USERNAME};
 
-#[cfg(target_os = "linux")]
+#[cfg(not(target_os = "freebsd"))]
 mod env;
 
 const TEST_ENV_EXPECTED_TTY: &str = "SUDO_RS_TEST_ENV_EXPECTED_TTY";
