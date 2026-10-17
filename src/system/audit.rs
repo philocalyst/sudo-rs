@@ -78,9 +78,9 @@ pub(crate) fn sudo_call<T>(
     Ok(result)
 }
 
-#[cfg(feature = "unstable-remote-sudoers")]
+#[cfg(all(feature = "unstable-remote-sudoers", target_os = "linux"))]
 /// Get the credentials of the peer at the other side of the socket
-fn get_peer_credentials(stream: &UnixStream) -> io::Result<libc::ucred> {
+fn get_peer_credentials(stream: &UnixStream) -> io::Result<(UserId, GroupId)> {
     let mut ucred = libc::ucred {
         pid: 0,
         uid: 0,
@@ -100,7 +100,18 @@ fn get_peer_credentials(stream: &UnixStream) -> io::Result<libc::ucred> {
         ))?;
     }
 
-    Ok(ucred)
+    Ok((UserId::new(ucred.uid), GroupId::new(ucred.gid)))
+}
+
+#[cfg(all(feature = "unstable-remote-sudoers", not(target_os = "linux")))]
+/// Get the credentials of the peer at the other side of the socket
+fn get_peer_credentials(stream: &UnixStream) -> io::Result<(UserId, GroupId)> {
+    let (mut uid, mut gid) = (0, 0);
+
+    // SAFETY: valid pointers to an uid and a gid are passed.
+    cerr(unsafe { libc::getpeereid(stream.as_raw_fd(), &mut uid, &mut gid) })?;
+
+    Ok((UserId::new(uid), GroupId::new(gid)))
 }
 
 /// Drop root privileges by setting effective user id equal to the real user id.
@@ -288,13 +299,13 @@ fn secure_open_socket_impl(
     let stream = UnixStream::connect(path)?;
 
     // Check the peer's credentials to avoid the TOCTOU.
-    let peer_creds = get_peer_credentials(&stream)?;
+    let (peer_uid, peer_gid) = get_peer_credentials(&stream)?;
 
     // If there is an error in these checks, the function returns immediately
     // leaving `stream` out of scope and forcing the closing of the socket.
-    check_peer(UserId::new(peer_creds.uid), user, "user")?;
+    check_peer(peer_uid, user, "user")?;
     if let Some(group) = group {
-        check_peer(GroupId::new(peer_creds.gid), group, "group")?;
+        check_peer(peer_gid, group, "group")?;
     }
 
     stream.shutdown(Shutdown::Write)?;
@@ -572,5 +583,22 @@ mod test {
         if file.metadata().is_ok_and(|meta| meta.len() == 0) {
             std::fs::remove_file(path).unwrap();
         }
+    }
+
+    #[cfg(feature = "unstable-remote-sudoers")]
+    #[test]
+    fn peer_credentials_are_those_of_the_listening_process() {
+        use std::os::unix::net::UnixListener;
+
+        let dir = crate::system::file::create_temporary_dir().unwrap();
+        let path = dir.join("socket");
+        let _listener = UnixListener::bind(&path).unwrap();
+        let credentials = get_peer_credentials(&UnixStream::connect(&path).unwrap());
+        std::fs::remove_dir_all(&dir).unwrap();
+
+        assert_eq!(
+            credentials.unwrap(),
+            (User::effective_uid(), User::effective_gid())
+        );
     }
 }
