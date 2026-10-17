@@ -108,6 +108,23 @@ pub struct Env {
     users: HashSet<Username>,
 }
 
+/// The operating system of the guest the compliance tests run against.
+///
+/// Docker runs Linux guests on every host it supports, macOS included; only the
+/// FreeBSD backend runs the tests on the host's own kernel. Paths, account
+/// tools and expected diagnostics therefore follow the guest rather than the
+/// host this harness happens to be compiled for.
+pub const GUEST_OS: &str = if cfg!(target_os = "freebsd") {
+    "freebsd"
+} else {
+    "linux"
+};
+
+/// Whether the guest the tests run against is Linux.
+pub fn is_linux_guest() -> bool {
+    GUEST_OS == "linux"
+}
+
 /// creates a new test environment builder that contains the specified `/etc/sudoers` file
 #[allow(non_snake_case)]
 pub fn Env(sudoers: impl Into<TextFile>) -> EnvBuilder {
@@ -121,7 +138,7 @@ pub fn Env(sudoers: impl Into<TextFile>) -> EnvBuilder {
         .insert_str(0, "Defaults !fqdn, !lecture, !mailerpath\n");
     builder.file(ETC_SUDOERS, sudoers);
 
-    if cfg!(target_os = "linux") {
+    if is_linux_guest() {
         // Ubuntu uses pam_env to set a bunch of extra env vars that various tests don't expect to be set.
         builder.default_file(PAM_D_SUDO_PATH, STOCK_PAM_D_SUDO);
         builder.default_file(PAM_D_SU_PATH, STOCK_PAM_D_SU);
@@ -414,7 +431,7 @@ impl EnvBuilder {
                             .stdin(password),
                     )
                     .assert_success();
-            } else if cfg!(target_os = "linux") {
+            } else if is_linux_guest() {
                 container
                     .output(Command::new("chpasswd").stdin(format!("{username}:{password}")))
                     .assert_success();
@@ -576,7 +593,7 @@ impl User {
                     )
                     .assert_success();
             }
-        } else if cfg!(target_os = "linux") {
+        } else if is_linux_guest() {
             let mut useradd = Command::new("useradd");
             useradd.arg("--no-user-group");
             if self.create_home_directory {
@@ -665,7 +682,7 @@ impl Group {
                 groupadd.arg(id.to_string());
             }
             container.output(&groupadd).assert_success();
-        } else if cfg!(target_os = "linux") {
+        } else if is_linux_guest() {
             let mut groupadd = Command::new("groupadd");
             if let Some(id) = self.id {
                 groupadd.arg("--gid");

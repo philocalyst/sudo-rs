@@ -12,6 +12,11 @@ On Arch Linux you can install the relevant packages with the following command:
 $ sudo pacman -S docker docker-buildx
 ```
 
+On macOS, the Docker suite runs Linux guests and uses the Linux Dockerfiles,
+account tools, PAM fixtures, paths, and expectations. It does not test native
+Darwin behavior. Use `../tests/macos_native.rs` (see `docs/macos.md`) for native privilege and PAM
+checks. FreeBSD uses its existing Podman/jail backend.
+
 ## Running the tests
 
 To run all the compliance tests against the original sudo execute the following command from this directory:

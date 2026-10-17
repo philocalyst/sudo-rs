@@ -43,11 +43,12 @@ fn three_retries_allowed_by_default() {
     };
     assert_contains!(output.stderr(), diagnostic);
 
-    let password_prompt = if sudo_test::is_original_sudo() && cfg!(target_os = "linux") {
-        "password for ferris:"
-    } else {
-        "Password:"
-    };
+    let password_prompt =
+        if sudo_test::is_original_sudo() && sudo_test::is_linux_guest() {
+            "password for ferris:"
+        } else {
+            "Password:"
+        };
 
     let num_password_prompts = stderr
         .lines()
@@ -84,11 +85,12 @@ Defaults passwd_tries=2"
     };
     assert_contains!(stderr, diagnostic);
 
-    let password_prompt = if sudo_test::is_original_sudo() && cfg!(target_os = "linux") {
-        "password for ferris:"
-    } else {
-        "Password:"
-    };
+    let password_prompt =
+        if sudo_test::is_original_sudo() && sudo_test::is_linux_guest() {
+            "password for ferris:"
+        } else {
+            "Password:"
+        };
 
     let num_password_prompts = stderr
         .lines()

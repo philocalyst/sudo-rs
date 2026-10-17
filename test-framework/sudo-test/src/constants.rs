@@ -69,7 +69,7 @@ pub const BIN_BASH: &str = "/usr/bin/bash";
 pub const BIN_BASH: &str = "/usr/local/bin/bash";
 
 /// Location of the sudo pam config
-#[cfg(target_os = "linux")]
+#[cfg(not(target_os = "freebsd"))]
 pub const PAM_D_SUDO_PATH: &str = "/etc/pam.d/sudo";
 
 /// Location of the sudo pam config

@@ -1,5 +1,5 @@
 use std::{
-    env::{self, consts::OS},
+    env,
     fs::{self, File},
     io::{ErrorKind, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
@@ -7,7 +7,7 @@ use std::{
     str,
 };
 
-use crate::{ROOT_GROUP, Result, SudoUnderTest, TextFile, base_image};
+use crate::{GUEST_OS, ROOT_GROUP, Result, SudoUnderTest, TextFile, base_image};
 
 pub use self::command::{As, Child, Command, Output};
 
@@ -270,7 +270,7 @@ pub fn build_base_image() {
             cmd.current_dir(repo_root);
             cmd.args([
                 "-f",
-                &format!("test-framework/sudo-test/src/ours.{OS}.Dockerfile"),
+                &format!("test-framework/sudo-test/src/ours.{GUEST_OS}.Dockerfile"),
                 ".",
             ]);
         }
@@ -280,7 +280,7 @@ pub fn build_base_image() {
             let f = File::open(
                 repo_root
                     .join("test-framework/sudo-test/src")
-                    .join(format!("theirs.{OS}.Dockerfile")),
+                    .join(format!("theirs.{GUEST_OS}.Dockerfile")),
             )
             .unwrap();
             cmd.arg("-").stdin(Stdio::from(f));
@@ -331,11 +331,25 @@ mod tests {
 
     use super::*;
 
-    #[cfg(target_os = "linux")]
+    #[cfg(not(target_os = "freebsd"))]
     const IMAGE: &str = "ubuntu:22.04";
 
     #[cfg(target_os = "freebsd")]
     const IMAGE: &str = "dougrabson/freebsd14-small:latest";
+
+    #[test]
+    fn guest_dockerfiles_exist_for_the_host_backend() {
+        for implementation in ["ours", "theirs"] {
+            let path = repo_root().join(format!(
+                "test-framework/sudo-test/src/{implementation}.{GUEST_OS}.Dockerfile"
+            ));
+            assert!(
+                path.is_file(),
+                "missing guest Dockerfile: {}",
+                path.display()
+            );
+        }
+    }
 
     #[test]
     fn eventually_removes_container_on_drop() {
@@ -380,7 +394,7 @@ mod tests {
 
         let docker = Container::new(IMAGE);
 
-        if cfg!(target_os = "linux") {
+        if crate::is_linux_guest() {
             docker
                 .output(Command::new("useradd").arg(username))
                 .assert_success();
