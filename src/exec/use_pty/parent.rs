@@ -1,12 +1,9 @@
 use std::collections::VecDeque;
 use std::ffi::c_int;
 use std::io;
-use std::os::fd::{FromRawFd, OwnedFd};
 use std::process::{Command, Stdio};
 
-use libc::{O_CLOEXEC, close};
-
-use crate::cutils::cerr;
+use crate::cutils::pipe_cloexec;
 use crate::exec::event::{EventHandle, EventRegistry, PollEvent, Process, StopReason};
 use crate::exec::use_pty::SIGCONT_FG;
 use crate::exec::use_pty::monitor::exec_monitor;
@@ -134,19 +131,9 @@ pub(in crate::exec) fn exec_pty(
             dev_info!("stdin is not a terminal, creating a pipe");
             exec_bg = true;
 
-            let mut pipes = [-1, -1];
-            // SAFETY: A valid pointer to a mutable array of 2 fds is passed in.
-            unsafe {
-                #[cfg(not(target_os = "macos"))]
-                cerr(libc::pipe2(pipes.as_mut_ptr(), O_CLOEXEC))?;
-                #[cfg(target_os = "macos")]
-                cerr(crate::cutils::pipe2(pipes.as_mut_ptr(), O_CLOEXEC))?;
-            }
-            // SAFETY: pipe2 created two owned pipe fds.
-            unsafe {
-                command.stdin(OwnedFd::from_raw_fd(pipes[0]));
-                close(pipes[1]);
-            }
+            let (pipe_read, pipe_write) = pipe_cloexec()?;
+            command.stdin(pipe_read);
+            drop(pipe_write);
         } else {
             dev_info!("stdin is not a terminal, command will inherit it");
             if io::stdin().is_pipe_or_socket() {
@@ -560,7 +547,7 @@ impl ParentClosure {
 
     /// Suspend sudo if the command is suspended.
     ///
-    /// Return `SIGCONT_FG` or `SIGCONT_BG` to state whether the command should be resumend in the
+    /// Return `SIGCONT_FG` or `SIGCONT_BG` to state whether the command should be resumed in the
     /// foreground or not.
     fn suspend_pty(
         &mut self,
@@ -590,6 +577,8 @@ impl ParentClosure {
                     signal_fmt(signal)
                 );
                 if !self.term_raw {
+                    // Format the same as og-sudo to reduce risk of divergence
+                    #[allow(clippy::collapsible_if)]
                     if self
                         .tty_pipe
                         .left_mut()
@@ -598,10 +587,10 @@ impl ParentClosure {
                     {
                         self.term_raw = true;
                     }
-                    // Resume command in the foreground
-                    self.tty_pipe.enable_input(registry);
-                    return Some(SIGCONT_FG);
                 }
+                // Resume command in the foreground
+                self.tty_pipe.enable_input(registry);
+                return Some(SIGCONT_FG);
             }
         }
 

@@ -114,29 +114,34 @@ impl Context {
 
         // resolve file arguments; if something can't be resolved, don't add it to the "edit" list
         let resolved_args = sudo_call(&target_user, &target_group, || {
-            sudo_options.positional_args.iter().map(|arg| {
-                let path = Path::new(arg);
-                let absolute_path;
-                crate::common::resolve::canonicalize_newfile(if path.is_absolute() {
-                    path
-                } else {
-                    absolute_path = Path::new(".").join(path);
-                    &absolute_path
+            sudo_options
+                .positional_args
+                .iter()
+                .map(|arg| {
+                    let path = Path::new(arg);
+                    let absolute_path;
+                    crate::common::resolve::canonicalize_newfile(if path.is_absolute() {
+                        path
+                    } else {
+                        absolute_path = Path::new(".").join(path);
+                        &absolute_path
+                    })
+                    .map_err(|_| arg)
+                    .and_then(|path| path.into_os_string().into_string().map_err(|_| arg))
                 })
-                .map_err(|_| arg)
-                .and_then(|path| path.into_os_string().into_string().map_err(|_| arg))
-            })
+                .collect::<Vec<_>>()
         })?;
 
         let files_to_edit = resolved_args
-            .clone()
-            .map(|path| path.ok().map(SudoPath::from_cli_string))
+            .iter()
+            .map(|path| path.clone().ok().map(SudoPath::from_cli_string))
             .collect();
 
         // if a path resolved to something that isn't in UTF-8, it means it isn't in the sudoers file
         // as well and so we treat it "as is" wrt. the policy lookup and fail if the user is allowed
         // by the policy to edit that file. this is to prevent leaking information.
         let arguments = resolved_args
+            .into_iter()
             .map(|arg| match arg {
                 Ok(arg) => OsString::from(arg),
                 Err(arg) => OsString::from(arg),
@@ -248,8 +253,8 @@ impl Context {
         controls: &Restrictions,
     ) -> Result<RunOptions<'_>, Error> {
         // see if the chdir flag is permitted
-        let mut chdir = match controls.chdir {
-            DirChange::Any => self.chdir.clone(),
+        let chdir = match &controls.chdir {
+            DirChange::Any => self.chdir.as_ref(),
             DirChange::Strict(optdir) => {
                 if let Some(chdir) = &self.chdir {
                     return Err(Error::ChDirNotAllowed {
@@ -257,15 +262,15 @@ impl Context {
                         command: self.command.command.clone(),
                     });
                 } else {
-                    optdir.cloned()
+                    optdir.as_ref()
                 }
             }
         };
 
         // expand tildes in the path with the users home directory
-        if let Some(dir) = chdir.take() {
-            chdir = Some(dir.expand_tilde_in_path(&self.target_user.name)?);
-        }
+        let chdir = chdir
+            .map(|dir| dir.expand_tilde_in_path(&self.target_user.name))
+            .transpose()?;
 
         Ok(RunOptions {
             command: if self.command.resolved {
@@ -307,12 +312,16 @@ mod tests {
 
         let context = Context::from_run_opts(options, &mut Default::default()).unwrap();
 
-        if cfg!(target_os = "linux") {
-            // this assumes /bin is a symlink on /usr/bin, like it is on modern Debian/Ubuntu
-            assert_eq!(context.command.command.to_str().unwrap(), "/usr/bin/echo");
-        } else {
-            assert_eq!(context.command.command.to_str().unwrap(), "/bin/echo");
-        }
+        // `echo` is looked up on PATH; which directory wins differs per
+        // platform and per distribution, so assert the properties instead.
+        let command = &context.command.command;
+        assert!(command.is_absolute(), "{command:?} is not absolute");
+        assert_eq!(command.file_name(), Some(std::ffi::OsStr::new("echo")));
+        assert!(command.exists(), "{command:?} does not exist");
+        assert_eq!(
+            command,
+            &crate::common::resolve::canonicalize(command).unwrap()
+        );
         assert_eq!(context.command.arguments, ["hello"]);
         assert_eq!(context.hostname, Hostname::resolve());
         assert_eq!(context.target_user.uid, current_user.uid);

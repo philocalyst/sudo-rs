@@ -21,14 +21,11 @@ impl SystemTime {
     }
 
     pub fn now() -> std::io::Result<SystemTime> {
-        #[cfg(any(target_os = "linux", target_os = "freebsd"))]
-        let clock_source = libc::CLOCK_BOOTTIME;
-        #[cfg(target_os = "macos")]
-        let clock_source = libc::CLOCK_MONOTONIC;
-
         let mut spec = MaybeUninit::<libc::timespec>::uninit();
         // SAFETY: valid pointer is passed to clock_gettime
-        crate::cutils::cerr(unsafe { libc::clock_gettime(clock_source, spec.as_mut_ptr()) })?;
+        crate::cutils::cerr(unsafe {
+            libc::clock_gettime(libc::CLOCK_BOOTTIME, spec.as_mut_ptr())
+        })?;
         // SAFETY: The `libc::clock_gettime` will correctly initialize `spec`,
         // otherwise it will return early with the `?` operator.
         let spec = unsafe { spec.assume_init() };
@@ -181,9 +178,19 @@ mod tests {
         use crate::system::{Process, WithProcess};
         let time = Process::starting_time(WithProcess::Current).unwrap();
 
+        #[cfg(target_os = "linux")]
         let now = {
             let super::SystemTime { secs, nsecs } = super::SystemTime::now().unwrap();
             super::ProcessCreateTime { secs, nsecs }
+        };
+        // BSD process creation times are wall-clock timestamps, used only as
+        // process identity tokens, rather than the monotonic timeout clock.
+        #[cfg(not(target_os = "linux"))]
+        let now = {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap();
+            super::ProcessCreateTime::new(now.as_secs() as i64, now.subsec_nanos().into())
         };
 
         assert!(time.secs > now.secs - 24 * 60 * 60);

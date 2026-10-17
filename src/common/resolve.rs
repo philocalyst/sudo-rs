@@ -63,9 +63,10 @@ impl CurrentUser {
     }
 
     pub fn resolve() -> Result<Self, Error> {
-        Ok(Self {
-            inner: User::real()?.ok_or(Error::UserNotFound("current user".to_string()))?,
-        })
+        let mut cur_user = User::real()?.ok_or(Error::UserNotFound("current user".to_string()))?;
+        // the current user can also have groups that are defined at runtime, so fetch the dynamic groups
+        cur_user.groups = User::real_groups()?;
+        Ok(Self { inner: cur_user })
     }
 }
 
@@ -338,38 +339,28 @@ pub fn canonicalize_newfile<P: AsRef<Path>>(path: P) -> io::Result<PathBuf> {
 #[cfg(test)]
 mod test {
     use super::canonicalize;
-    use std::path::Path;
+    use std::{fs, path::Path};
 
     #[test]
     fn canonicalization() {
         assert_eq!(canonicalize("/").unwrap(), Path::new("/"));
         assert!(canonicalize("").is_err());
-        if cfg!(any(target_os = "linux")) {
-            // this test REQUIRES /usr/bin/unxz to be a symlink for /usr/bin/xz or /usr/bin/busybox
-            assert!(Path::new("/bin").is_symlink());
-            assert!(Path::new("/usr/bin/unxz").is_symlink());
-            assert_eq!(
-                canonicalize("/usr/bin/unxz").unwrap(),
-                Path::new("/usr/bin/unxz")
-            );
-            // this assumes /bin is a symlink on /usr/bin, like it is on modern Debian/Ubuntu
-            assert_eq!(
-                canonicalize("/bin/unxz").unwrap(),
-                Path::new("/usr/bin/unxz")
-            );
-        } else if cfg!(target_os = "freebsd") {
-            // this test REQUIRES /usr/bin/pkill to be a symlink
-            assert!(Path::new("/usr/bin/pkill").is_symlink());
-            assert_eq!(
-                canonicalize("/usr/bin/pkill").unwrap(),
-                Path::new("/usr/bin/pkill")
-            );
-            assert_eq!(canonicalize("/bin/pkill").unwrap(), Path::new("/bin/pkill"));
-        } else {
-            panic!(
-                "canonicalization test not yet adapted for {}",
-                std::env::consts::OS
-            );
-        }
+        let dir = crate::system::file::create_temporary_dir().unwrap();
+        let actual = dir.join("actual");
+        fs::create_dir(&actual).unwrap();
+        fs::write(actual.join("file"), b"test").unwrap();
+        std::os::unix::fs::symlink("actual", dir.join("alias")).unwrap();
+        std::os::unix::fs::symlink("file", actual.join("link")).unwrap();
+        let actual = fs::canonicalize(actual).unwrap();
+        assert_eq!(
+            canonicalize(dir.join("alias/file")).unwrap(),
+            actual.join("file")
+        );
+        assert_eq!(
+            canonicalize(dir.join("alias/link")).unwrap(),
+            actual.join("link")
+        );
+        assert!(canonicalize(dir.join("missing")).is_err());
+        fs::remove_dir_all(dir).unwrap();
     }
 }

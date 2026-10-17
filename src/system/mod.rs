@@ -16,9 +16,6 @@ use crate::{
 };
 use interface::{DeviceId, GroupId, ProcessId, UserId};
 pub use libc::PATH_MAX;
-#[cfg(target_os = "macos")]
-use libc::STDERR_FILENO;
-#[cfg(not(target_os = "macos"))]
 use libc::{CLOSE_RANGE_CLOEXEC, EINVAL, ENOSYS, STDERR_FILENO};
 use time::ProcessCreateTime;
 
@@ -40,19 +37,27 @@ pub mod term;
 
 pub mod wait;
 
-#[cfg(not(any(target_os = "freebsd", target_os = "linux", target_os = "macos")))]
-compile_error!("sudo-rs only works on Linux, FreeBSD and MacOS");
+#[cfg(not(any(target_os = "freebsd", target_os = "linux")))]
+compile_error!("sudo-rs only works on Linux and FreeBSD");
 
 pub(crate) fn _exit(status: c_int) -> ! {
     // SAFETY: this function is safe to call
     unsafe { libc::_exit(status) }
 }
 
-/// Mark every file descriptor that is not one of the IO streams as CLOEXEC.
-#[cfg(not(target_os = "macos"))]
-pub(crate) fn mark_fds_as_cloexec() -> io::Result<()> {
-    let lowfd = STDERR_FILENO + 1;
+fn set_cloexec(fd: c_int) -> io::Result<()> {
+    // SAFETY: This only sets the CLOEXEC flag; it does not close or invalidate the fd.
+    match unsafe { cerr(libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC)) } {
+        Ok(_) => Ok(()),
+        // An enumerated descriptor may have disappeared since the snapshot.
+        Err(err) if err.raw_os_error() == Some(libc::EBADF) => Ok(()),
+        Err(err) => Err(err),
+    }
+}
 
+/// Attempts close_range(CLOSE_RANGE_CLOEXEC) for all fds >= lowfd.
+/// Returns Ok(true) on success, Ok(false) if unsupported, Err on any other failure.
+fn try_close_range(lowfd: c_int) -> io::Result<bool> {
     // SAFETY: this function is safe to call:
     // - any errors while closing a specific fd will be effectively ignored
     #[allow(clippy::diverging_sub_expression)]
@@ -75,56 +80,56 @@ pub(crate) fn mark_fds_as_cloexec() -> io::Result<()> {
             ));
         }
     };
-
     match res {
-        Err(err) if err.raw_os_error() == Some(ENOSYS) || err.raw_os_error() == Some(EINVAL) => {
-            mark_fds_as_cloexec_fallback(lowfd);
-        }
-        Err(err) => Err(err),
-        Ok(_) => Ok(()),
+        Ok(_) => Ok(true),
+        Err(e) if e.raw_os_error() == Some(ENOSYS) || e.raw_os_error() == Some(EINVAL) => Ok(false),
+        Err(e) => Err(e),
     }
 }
 
-#[cfg(target_os = "macos")]
-pub(crate) fn mark_fds_as_cloexec() -> io::Result<()> {
-    mark_fds_as_cloexec_fallback(STDERR_FILENO + 1)
-}
+/// Sets CLOEXEC on all fds >= lowfd by walking an fd directory
+/// (/proc/self/fd on Linux, /dev/fd on FreeBSD).
+fn cloexec_via_fd_dir(lowfd: c_int, path: &str) -> io::Result<()> {
+    for entry in fs::read_dir(path)? {
+        let file_name = entry?.file_name();
 
-fn mark_fds_as_cloexec_fallback(lowfd: i32) -> io::Result<()> {
-    // If the kernel doesn't support close_range or CLOSE_RANGE_CLOEXEC,
-    // fallback to finding all open fds using /proc/self/fd or /dev/fd
-
-    for entry in fs::read_dir(if cfg!(target_os = "linux") {
-        "/proc/self/fd"
-    } else {
-        "/dev/fd"
-    })? {
-        let entry = entry?;
-        let file_name = entry.file_name();
-        let file_name = file_name.to_str().ok_or(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "procfs returned non-integer fd name",
-        ))?;
         if file_name == "." || file_name == ".." {
             continue;
         }
-        let fd = file_name.parse::<c_int>().map_err(|_| {
-            io::Error::new(
-                io::ErrorKind::InvalidData,
-                "procfs returned non-integer fd name",
-            )
-        })?;
-        if fd < lowfd {
-            continue;
-        }
-        // SAFETY: This only sets the CLOEXEC flag for the given fd. Nothing is
-        // going to need it after exec.
-        unsafe {
-            cerr(libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC))?;
+
+        let fd = file_name
+            .to_str()
+            .and_then(|s| s.parse::<c_int>().ok())
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "fd directory returned non-integer fd name",
+                )
+            })?;
+
+        if fd >= lowfd {
+            set_cloexec(fd)?;
         }
     }
-
     Ok(())
+}
+
+#[cfg(target_os = "linux")]
+const FD_DIR: &str = "/proc/self/fd";
+#[cfg(not(target_os = "linux"))]
+const FD_DIR: &str = "/dev/fd";
+
+/// Mark every file descriptor that is not one of the IO streams as CLOEXEC.
+pub(crate) fn mark_fds_as_cloexec() -> io::Result<()> {
+    let lowfd = STDERR_FILENO + 1;
+
+    if try_close_range(lowfd)? {
+        return Ok(());
+    }
+
+    // The kernel doesn't support close_range or CLOSE_RANGE_CLOEXEC,
+    // so fall back to enumerating the platform's fd directory.
+    cloexec_via_fd_dir(lowfd, FD_DIR)
 }
 
 pub(crate) enum ForkResult {
@@ -161,7 +166,6 @@ pub(crate) unsafe fn fork() -> io::Result<ForkResult> {
 unsafe fn fork_for_test(child_func: impl FnOnce() -> std::convert::Infallible) -> ProcessId {
     use std::io::Write;
     use std::panic::{AssertUnwindSafe, catch_unwind};
-    use std::process::exit;
 
     // SAFETY: Not really safe, but this is test only code.
     match unsafe { fork() }.unwrap() {
@@ -181,7 +185,8 @@ unsafe fn fork_for_test(child_func: impl FnOnce() -> std::convert::Infallible) -
             };
             let _ = writeln!(std::io::stderr(), "{s}");
 
-            exit(101);
+            // Runtime cleanup can acquire locks held by threads lost at fork.
+            _exit(101);
         }
         ForkResult::Parent(pid) => pid,
     }
@@ -289,8 +294,6 @@ fn set_supplementary_groups(groups: &[GroupId]) -> io::Result<()> {
     let Ok(len) = groups.len().try_into() else {
         return Err(io::Error::other("too many groups"));
     };
-    #[cfg(target_os = "macos")]
-    let len = std::cmp::min(16, len);
     // SAFETY: setgroups is passed a valid pointer to a chunk of memory of the correct size
     // We can cast to gid_t because `GroupId` is marked as transparent
     cerr(unsafe { libc::setgroups(len, groups.as_ptr().cast::<libc::gid_t>()) })?;
@@ -389,34 +392,33 @@ impl User {
     /// This function expects `pwd` to be a result from a successful call to `getpwXXX_r`.
     /// (It can cause UB if any of `pwd`'s pointed-to strings does not have a null-terminator.)
     unsafe fn from_libc(pwd: &libc::passwd) -> Result<User, Error> {
-        let mut buf_len: c_int = 32;
-        let mut groups_buffer: Vec<libc::gid_t>;
+        // NOTE: on Linux, getgrouplist could be used to simply inquire as to the size needed;
+        // but on FreeBSD, getgrouplist does not specify this in its function contract, so a
+        // blind allocation loop is needed.
+        let Some(groups_buffer) =
+            dynamic_fill::<libc::gid_t, std::num::TryFromIntError>(32..65536, |groups_buffer| {
+                let mut buf_len: c_int = groups_buffer.len() as c_int;
+                // SAFETY: getgrouplist is passed valid pointers
+                // in particular `groups_buffer` is an array of `buf.len()` bytes, as required
+                let result = unsafe {
+                    libc::getgrouplist(
+                        pwd.pw_name,
+                        pwd.pw_gid,
+                        groups_buffer.as_mut_ptr(),
+                        &mut buf_len,
+                    )
+                };
 
-        while {
-            groups_buffer = vec![0; buf_len as usize];
-            // SAFETY: getgrouplist is passed valid pointers
-            // in particular `groups_buffer` is an array of `buf.len()` bytes, as required
-            let result = unsafe {
-                libc::getgrouplist(
-                    pwd.pw_name,
-                    pwd.pw_gid as _,
-                    groups_buffer.as_mut_ptr() as _,
-                    &mut buf_len,
-                )
-            };
-
-            result == -1
-        } {
-            if buf_len >= 65536 {
-                panic!("user has too many groups (> 65536), this should not happen");
-            }
-
-            buf_len *= 2;
-        }
-
-        groups_buffer.resize_with(buf_len as usize, || {
-            panic!("invalid groups count returned from getgrouplist, this should not happen")
-        });
+                Ok(if result != -1 {
+                    Some(buf_len.try_into()?)
+                } else {
+                    None
+                })
+            })
+            .expect("negative group size, this should not happen")
+        else {
+            panic!("user has too many groups (> 65536), this should not happen");
+        };
 
         // SAFETY: All pointers were initialized by a successful call to `getpwXXX_r` as per the
         // safety invariant of this function.
@@ -436,23 +438,33 @@ impl User {
     }
 
     pub fn from_uid(uid: UserId) -> Result<Option<User>, Error> {
-        let max_pw_size = sysconf(libc::_SC_GETPW_R_SIZE_MAX).unwrap_or(16_384);
-        let mut buf = vec![0; max_pw_size as usize];
+        let initial_pw_size = sysconf(libc::_SC_GETPW_R_SIZE_MAX).unwrap_or(16_384) as usize;
+        let max_pw_size = std::cmp::max(i32::MAX as usize, usize::MAX >> 24);
         let mut pwd = MaybeUninit::uninit();
         let mut pwd_ptr = std::ptr::null_mut();
-        // SAFETY: getpwuid_r is passed valid (although partly uninitialized) pointers to memory,
-        // in particular `buf` points to an array of `buf.len()` bytes, as required.
-        // After this call, if `pwd_ptr` is not NULL, `*pwd_ptr` and `pwd` will be aliased;
-        // but we never dereference `pwd_ptr`.
-        cerr(unsafe {
-            libc::getpwuid_r(
-                uid.inner(),
-                pwd.as_mut_ptr(),
-                buf.as_mut_ptr(),
-                buf.len(),
-                &mut pwd_ptr,
-            )
-        })?;
+        let Some(_buf) = dynamic_fill(initial_pw_size..max_pw_size, |buf| {
+            // SAFETY: getpwuid_r is passed valid (although partly uninitialized) pointers to memory,
+            // in particular `buf` points to an array of `buf.len()` bytes, as required.
+            // After this call, if `pwd_ptr` is not NULL, `*pwd_ptr` and `pwd` will be aliased;
+            // but we never dereference `pwd_ptr`.
+            let result = unsafe {
+                libc::getpwuid_r(
+                    uid.inner(),
+                    pwd.as_mut_ptr(),
+                    buf.as_mut_ptr(),
+                    buf.len(),
+                    &mut pwd_ptr,
+                )
+            };
+            match result {
+                0 | libc::ENOENT => Ok(Some(buf.len())),
+                libc::ERANGE => Ok(None),
+                _ => Err(io::Error::from_raw_os_error(result)),
+            }
+        })?
+        else {
+            panic!("password buffer size exceeds limit (>{max_pw_size})");
+        };
         if pwd_ptr.is_null() {
             Ok(None)
         } else {
@@ -495,21 +507,30 @@ impl User {
     }
 
     pub fn from_name(name_c: &CStr) -> Result<Option<User>, Error> {
-        let max_pw_size = sysconf(libc::_SC_GETPW_R_SIZE_MAX).unwrap_or(16_384);
-        let mut buf = vec![0; max_pw_size as usize];
+        let initial_pw_size = sysconf(libc::_SC_GETPW_R_SIZE_MAX).unwrap_or(16_384) as usize;
+        let max_pw_size = std::cmp::max(i32::MAX as usize, usize::MAX >> 24);
         let mut pwd = MaybeUninit::uninit();
         let mut pwd_ptr = std::ptr::null_mut();
-
-        // SAFETY: analogous to getpwuid_r above
-        cerr(unsafe {
-            libc::getpwnam_r(
-                name_c.as_ptr(),
-                pwd.as_mut_ptr(),
-                buf.as_mut_ptr(),
-                buf.len(),
-                &mut pwd_ptr,
-            )
-        })?;
+        let Some(_buf) = dynamic_fill(initial_pw_size..max_pw_size, |buf| {
+            // SAFETY: analogous to getpwuid_r above
+            let result = unsafe {
+                libc::getpwnam_r(
+                    name_c.as_ptr(),
+                    pwd.as_mut_ptr(),
+                    buf.as_mut_ptr(),
+                    buf.len(),
+                    &mut pwd_ptr,
+                )
+            };
+            match result {
+                0 | libc::ENOENT => Ok(Some(buf.len())),
+                libc::ERANGE => Ok(None),
+                _ => Err(io::Error::from_raw_os_error(result)),
+            }
+        })?
+        else {
+            panic!("password buffer size exceeds limit (>{max_pw_size})");
+        };
         if pwd_ptr.is_null() {
             Ok(None)
         } else {
@@ -519,6 +540,31 @@ impl User {
             // SAFETY: `pwd` was obtained by a call to getpwXXX_r, as required.
             unsafe { Self::from_libc(&pwd).map(Some) }
         }
+    }
+
+    pub fn real_groups() -> Result<Vec<GroupId>, Error> {
+        // From man getgroups:
+        //   The maximum number of supplementary group IDs can be found at run time using sysconf(3):
+        //   ngroups_max = sysconf(_SC_NGROUPS_MAX);
+        //   The  maximum  return  value of getgroups() cannot be larger than one more than this value.
+        // So, unlike the "_MAX" definitions above which suggest an initial size, this really is the "max" value.
+        let len = sysconf(libc::_SC_NGROUPS_MAX).unwrap_or(65536) as usize;
+        let mut groups = vec![GroupId::new(u32::MAX); len];
+
+        let len = len
+            .try_into()
+            .expect("_SC_NGROUPS_MAX should fit in a c_int");
+
+        // SAFETY: getgroups is passed a valid pointer to a chunk of memory of the correct size
+        // We can cast to gid_t because `GroupId` is marked as transparent
+        let num_groups =
+            cerr(unsafe { libc::getgroups(len, groups.as_mut_ptr().cast::<libc::gid_t>()) })?;
+
+        groups.resize_with(num_groups as usize, || {
+            panic!("invalid groups count returned from getgroups, this should not happen")
+        });
+
+        Ok(groups)
     }
 }
 
@@ -546,20 +592,36 @@ impl Group {
 
     /// Lookup group for gid without returning an error when a /etc/group entry is missing.
     fn from_gid_unchecked(gid: GroupId) -> std::io::Result<Group> {
-        let max_gr_size = sysconf(libc::_SC_GETGR_R_SIZE_MAX).unwrap_or(16_384);
-        let mut buf = vec![0; max_gr_size as usize];
+        // Set an arbitrary upper limit of two terabytes/two gigabytes for the temporary buffer
+        let initial_gr_size = sysconf(libc::_SC_GETGR_R_SIZE_MAX).unwrap_or(16_384) as usize;
+        let max_gr_size = std::cmp::max(i32::MAX as usize, usize::MAX >> 24);
+
         let mut grp = MaybeUninit::uninit();
         let mut grp_ptr = std::ptr::null_mut();
-        // SAFETY: analogous to getpwuid_r above
-        cerr(unsafe {
-            libc::getgrgid_r(
-                gid.inner(),
-                grp.as_mut_ptr(),
-                buf.as_mut_ptr(),
-                buf.len(),
-                &mut grp_ptr,
-            )
-        })?;
+        let Some(_buf) = dynamic_fill(initial_gr_size..max_gr_size, |buf| {
+            // SAFETY: analogous to getpwuid_r above
+            let result = unsafe {
+                libc::getgrgid_r(
+                    gid.inner(),
+                    grp.as_mut_ptr(),
+                    buf.as_mut_ptr(),
+                    buf.len(),
+                    &mut grp_ptr,
+                )
+            };
+            match result {
+                // These values signify the lookup could reach a conclusion (either the group exists,
+                // or it clearly doesn't). So don't try to increase the buffer size. If the group wasn't found,
+                // `grp_ptr` is set to NULL per the man page.
+                0 | libc::ENOENT => Ok(Some(buf.len())),
+                libc::ERANGE => Ok(None),
+                _ => Err(io::Error::from_raw_os_error(result)),
+            }
+        })?
+        else {
+            panic!("group buffer size exceeds limit (>{max_gr_size})");
+        };
+
         if grp_ptr.is_null() {
             Ok(Group { gid, name: None })
         } else {
@@ -582,20 +644,33 @@ impl Group {
     }
 
     pub fn from_name(name_c: &CStr) -> std::io::Result<Option<Group>> {
-        let max_gr_size = sysconf(libc::_SC_GETGR_R_SIZE_MAX).unwrap_or(16_384);
-        let mut buf = vec![0; max_gr_size as usize];
+        // Set an arbitrary upper limit of two terabytes/two gigabytes for the temporary buffer
+        let initial_gr_size = sysconf(libc::_SC_GETGR_R_SIZE_MAX).unwrap_or(16_384) as usize;
+        let max_gr_size = std::cmp::max(i32::MAX as usize, usize::MAX >> 24);
         let mut grp = MaybeUninit::uninit();
         let mut grp_ptr = std::ptr::null_mut();
-        // SAFETY: analogous to getpwuid_r above
-        cerr(unsafe {
-            libc::getgrnam_r(
-                name_c.as_ptr(),
-                grp.as_mut_ptr(),
-                buf.as_mut_ptr(),
-                buf.len(),
-                &mut grp_ptr,
-            )
-        })?;
+        let Some(_buf) = dynamic_fill(initial_gr_size..max_gr_size, |buf| {
+            // SAFETY: analogous to getpwuid_r above
+            let result = unsafe {
+                libc::getgrnam_r(
+                    name_c.as_ptr(),
+                    grp.as_mut_ptr(),
+                    buf.as_mut_ptr(),
+                    buf.len(),
+                    &mut grp_ptr,
+                )
+            };
+            match result {
+                // As above
+                0 | libc::ENOENT => Ok(Some(buf.len())),
+                libc::ERANGE => Ok(None),
+                _ => Err(io::Error::from_raw_os_error(result)),
+            }
+        })?
+        else {
+            panic!("group buffer size exceeds limit (>{max_gr_size})");
+        };
+
         if grp_ptr.is_null() {
             Ok(None)
         } else {
@@ -744,13 +819,6 @@ impl Process {
         }
     }
 
-    /// Returns the device identifier of the TTY device that is currently
-    /// attached to the given process
-    #[cfg(target_os = "macos")]
-    pub fn tty_device_id(pid: WithProcess) -> std::io::Result<Option<DeviceId>> {
-        Ok(None)
-    }
-
     /// Get the process starting time of a specific process
     #[cfg(target_os = "linux")]
     pub fn starting_time(pid: WithProcess) -> io::Result<ProcessCreateTime> {
@@ -780,12 +848,6 @@ impl Process {
             i64::from(ki_start.tv_sec),
             i64::from(ki_start.tv_usec) * 1000,
         ))
-    }
-
-    /// Get the process starting time of a specific process
-    #[cfg(target_os = "macos")]
-    pub fn starting_time(pid: WithProcess) -> io::Result<ProcessCreateTime> {
-        Ok(ProcessCreateTime::new(0, 0))
     }
 }
 
@@ -890,7 +952,6 @@ mod tests {
             fd::{AsFd, AsRawFd},
             unix::net::UnixStream,
         },
-        process::exit,
     };
 
     use libc::SIGKILL;
@@ -898,7 +959,7 @@ mod tests {
     use crate::system::interface::{GroupId, ProcessId, UserId};
 
     use super::{
-        Group, ROOT_GROUP_NAME, User, WithProcess, fork_for_test, getpgrp, setpgid,
+        _exit as exit, Group, ROOT_GROUP_NAME, User, WithProcess, fork_for_test, getpgrp, setpgid,
         wait::{Wait, WaitOptions},
     };
 
@@ -939,6 +1000,12 @@ mod tests {
             assert_eq!(root.gid, id);
             assert_eq!(root.name.unwrap(), name);
         }
+    }
+
+    #[test]
+    fn test_group_lookup_fails_gracefully() {
+        assert_eq!(Group::from_gid(GroupId::new(32767)).unwrap(), None);
+        assert_eq!(Group::from_name(c"nosuchgroupexists").unwrap(), None);
     }
 
     #[test]
@@ -1062,6 +1129,45 @@ mod tests {
         crate::cutils::cerr(unsafe { libc::fcntl(fd.as_fd().as_raw_fd(), libc::F_GETFD) }).unwrap()
             & libc::FD_CLOEXEC
             == libc::FD_CLOEXEC
+    }
+
+    fn check_descriptor_inheritance(mark: impl Fn()) {
+        let child = unsafe {
+            fork_for_test(|| {
+                let file = std::fs::File::open("/dev/null").unwrap();
+                // F_DUPFD deliberately creates a sparse, inheritable descriptor.
+                let fd =
+                    crate::cutils::cerr(libc::fcntl(file.as_raw_fd(), libc::F_DUPFD, 128)).unwrap();
+                let open_in_child = |expected: bool| {
+                    let op = if expected { "-e" } else { "! -e" };
+                    std::process::Command::new("/bin/sh")
+                        .args(["-c", &format!("test {op} /dev/fd/{fd}")])
+                        .status()
+                        .unwrap()
+                        .success()
+                };
+                assert!(
+                    open_in_child(true),
+                    "control: descriptor must survive exec before marking"
+                );
+                mark();
+                assert!(open_in_child(false), "descriptor leaked through exec");
+                assert_eq!(libc::close(fd), 0);
+                exit(0);
+            })
+        };
+        let (_, status) = child.wait(WaitOptions::new()).unwrap();
+        assert_eq!(status.exit_status(), Some(0));
+    }
+
+    #[test]
+    fn cloexec_prevents_descriptor_inheritance() {
+        check_descriptor_inheritance(|| super::mark_fds_as_cloexec().unwrap());
+    }
+
+    #[test]
+    fn fd_directory_fallback_prevents_descriptor_inheritance() {
+        check_descriptor_inheritance(|| super::cloexec_via_fd_dir(3, super::FD_DIR).unwrap());
     }
 
     #[test]
