@@ -1,3 +1,4 @@
+mod background;
 mod event;
 mod io_util;
 mod no_pty;
@@ -24,9 +25,9 @@ use crate::{
     exec::no_pty::exec_no_pty,
     log::{dev_info, dev_warn, user_error},
     system::{
-        _exit, ForkResult, Group, User, fork,
+        _exit, Group, User,
         interface::ProcessId,
-        kill, killpg, mark_fds_as_cloexec, set_target_user, setpgid,
+        kill, killpg, mark_fds_as_cloexec, set_target_user,
         signal::{SignalNumber, SignalSet, SignalsState, consts::*, exit_with_signal, signal_name},
         term::UserTerm,
         wait::{Wait, WaitError, WaitOptions},
@@ -34,6 +35,7 @@ use crate::{
 };
 
 use self::{
+    background::BackgroundStatus,
     event::{EventRegistry, Process},
     io_util::was_interrupted,
     use_pty::{SIGCONT_BG, SIGCONT_FG, exec_pty},
@@ -83,18 +85,16 @@ pub fn run_command(
     options: RunOptions<'_>,
     env: impl IntoIterator<Item = (impl AsRef<OsStr>, impl AsRef<OsStr>)>,
 ) -> io::Result<ExitReason> {
-    if options.background {
-        // SAFETY: There should be no other threads at this point.
-        match unsafe { fork() }? {
-            ForkResult::Parent(_) => process::exit(0),
-            ForkResult::Child => {
-                // Child continues in an orphaned process group.
-                // Reads from the terminal fail with EIO.
-                // Writes succeed unless tostop is set on the terminal.
-                setpgid(ProcessId::new(0), ProcessId::new(0))?;
-            }
-        }
+    // Reject unsupported policy before backgrounding, so the original caller
+    // receives the failure instead of a successful background-parent exit.
+    #[cfg(not(target_os = "linux"))]
+    if options.noexec {
+        return Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "NOEXEC is currently only supported on Linux",
+        ));
     }
+    let background_status = BackgroundStatus::start(options.background)?;
 
     // FIXME: should we pipe the stdio streams?
     let qualified_path = options.command;
@@ -117,18 +117,14 @@ pub fn run_command(
         command.arg0(OsStr::from_bytes(&process_name));
     }
 
+    #[cfg(target_os = "linux")]
     let spawn_noexec_handler = if options.noexec {
-        #[cfg(not(target_os = "linux"))]
-        return Err(io::Error::new(
-            io::ErrorKind::Other,
-            "NOEXEC is currently only supported on Linux",
-        ));
-
-        #[cfg(target_os = "linux")]
         Some(noexec::add_noexec_filter(&mut command)?)
     } else {
         None
     };
+    #[cfg(not(target_os = "linux"))]
+    let spawn_noexec_handler = None;
 
     // Decide if the pwd should be changed. `--chdir` takes precedence over `-i`.
     let path = options
@@ -199,14 +195,15 @@ pub fn run_command(
                 user_tty,
                 options.user,
                 options.background,
+                background_status,
             ),
             Err(err) => {
                 dev_info!("Could not open user's terminal, not allocating a pty: {err}");
-                exec_no_pty(sudo_pid, spawn_noexec_handler, command)
+                exec_no_pty(sudo_pid, spawn_noexec_handler, command, background_status)
             }
         }
     } else {
-        exec_no_pty(sudo_pid, spawn_noexec_handler, command)
+        exec_no_pty(sudo_pid, spawn_noexec_handler, command, background_status)
     }
 }
 
@@ -348,4 +345,56 @@ const fn cond_fmt<'a>(cond: bool, true_s: &'a str, false_s: &'a str) -> &'a str 
 
 const fn opt_fmt(cond: bool, s: &str) -> &str {
     cond_fmt(cond, s, "")
+}
+
+#[cfg(all(test, not(target_os = "linux")))]
+mod tests {
+    use super::*;
+    use std::io::Write;
+
+    #[test]
+    fn unsupported_noexec_is_rejected_before_background_fork() {
+        const CHILD: &str = "SUDO_RS_TEST_UNSUPPORTED_NOEXEC";
+        const CHECKED: &str = "unsupported policy rejected without forking";
+        if let Some(background) = env::var_os(CHILD) {
+            let user = User::real().unwrap().unwrap();
+            let group = user.primary_group().unwrap();
+            let pid = std::process::id();
+            let result = run_command(
+                RunOptions {
+                    command: Path::new("/bin/true"),
+                    arguments: &[],
+                    arg0: None,
+                    chdir: None,
+                    is_login: false,
+                    user: &user,
+                    group: &group,
+                    umask: Umask::Preserve,
+                    background: background == "yes",
+                    use_pty: false,
+                    noexec: true,
+                },
+                std::iter::empty::<(OsString, OsString)>(),
+            );
+            assert_eq!(std::process::id(), pid, "rejected policy forked a child");
+            assert!(matches!(result, Err(err) if err.kind() == io::ErrorKind::Unsupported));
+            writeln!(io::stdout().lock(), "{CHECKED}").unwrap();
+            return;
+        }
+        for background in ["no", "yes"] {
+            let output = Command::new(env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "exec::tests::unsupported_noexec_is_rejected_before_background_fork",
+                    "--nocapture",
+                ])
+                .env(CHILD, background)
+                .output()
+                .unwrap();
+            assert!(output.status.success());
+            // Checking the marker also catches a background parent that exits
+            // successfully before reaching the assertions in the child case.
+            assert!(String::from_utf8_lossy(&output.stdout).contains(CHECKED));
+        }
+    }
 }

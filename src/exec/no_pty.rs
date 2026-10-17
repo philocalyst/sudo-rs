@@ -2,7 +2,8 @@ use std::{ffi::c_int, io, process::Command};
 
 use super::{
     ExitReason, HandleSigchld,
-    event::PollEvent,
+    background::BackgroundStatus,
+    event::{EventHandle, PollEvent},
     event::{EventRegistry, Process, StopReason},
     io_util::was_interrupted,
     terminate_process,
@@ -30,6 +31,7 @@ pub(super) fn exec_no_pty(
     sudo_pid: ProcessId,
     spawn_noexec_handler: Option<SpawnNoexecHandler>,
     command: Command,
+    background_status: BackgroundStatus,
 ) -> io::Result<ExitReason> {
     // FIXME (ogsudo): Initialize the policy plugin's session here.
 
@@ -56,8 +58,13 @@ pub(super) fn exec_no_pty(
         err
     })?
     else {
+        drop(errpipe_rx);
         exec_command(command, original_set, original_signals, errpipe_tx);
     };
+
+    // EOF on the exec-error pipe confirms that the command reached exec.
+    drop(errpipe_tx);
+    drop(command);
 
     if let Some(spawner) = spawn_noexec_handler {
         spawner.spawn();
@@ -73,6 +80,7 @@ pub(super) fn exec_no_pty(
         errpipe_rx,
         &mut registry,
         original_signals,
+        background_status,
     )?;
 
     // Restore the signal mask now that the handlers have been setup.
@@ -98,6 +106,8 @@ struct ExecClosure {
     sudo_pid: ProcessId,
     parent_pgrp: ProcessId,
     errpipe_rx: BinPipe<i32>,
+    errpipe_handle: EventHandle,
+    background_status: BackgroundStatus,
     original_signals: SignalsState,
     signal_stream: &'static SignalStream,
     signal_handlers: [SignalHandler; ExecClosure::SIGNALS.len()],
@@ -115,8 +125,10 @@ impl ExecClosure {
         errpipe_rx: BinPipe<i32>,
         registry: &mut EventRegistry<Self>,
         mut original_signals: SignalsState,
+        background_status: BackgroundStatus,
     ) -> io::Result<Self> {
-        registry.register_event(&errpipe_rx, PollEvent::Readable, |_| ExecEvent::ErrPipe);
+        let errpipe_handle =
+            registry.register_event(&errpipe_rx, PollEvent::Readable, |_| ExecEvent::ErrPipe);
 
         let signal_stream = SignalStream::init()?;
 
@@ -127,12 +139,37 @@ impl ExecClosure {
         Ok(Self {
             command_pid: Some(command_pid),
             errpipe_rx,
+            errpipe_handle,
+            background_status,
             sudo_pid,
             parent_pgrp: getpgrp(),
             original_signals,
             signal_stream,
             signal_handlers,
         })
+    }
+
+    fn read_exec_status(&mut self, registry: &mut EventRegistry<Self>) {
+        if !self.errpipe_handle.is_active() {
+            return;
+        }
+        match self.errpipe_rx.read() {
+            Err(err) if was_interrupted(&err) => {}
+            Err(err) if err.kind() == io::ErrorKind::UnexpectedEof => {
+                self.errpipe_handle.ignore(registry);
+                if let Err(err) = self.background_status.started() {
+                    registry.set_break(err);
+                }
+            }
+            result => {
+                let err = match result {
+                    Err(err) => err,
+                    Ok(errno) => io::Error::from_raw_os_error(errno),
+                };
+                self.background_status.failed(&err);
+                registry.set_break(err);
+            }
+        }
     }
 
     /// Decides if the signal sent by the process with `signaler_pid` PID is self-terminating.
@@ -279,16 +316,7 @@ impl Process for ExecClosure {
     fn on_event(&mut self, event: Self::Event, registry: &mut EventRegistry<Self>) {
         match event {
             ExecEvent::Signal => self.on_signal(registry),
-            ExecEvent::ErrPipe => {
-                match self.errpipe_rx.read() {
-                    Err(err) if was_interrupted(&err) => { /* Retry later */ }
-                    Err(err) => registry.set_break(err),
-                    Ok(error_code) => {
-                        // Received error code from the command, forward it to the parent.
-                        registry.set_break(io::Error::from_raw_os_error(error_code));
-                    }
-                }
-            }
+            ExecEvent::ErrPipe => self.read_exec_status(registry),
         }
     }
 }
@@ -297,12 +325,18 @@ impl HandleSigchld for ExecClosure {
     const OPTIONS: WaitOptions = WaitOptions::new().all().untraced().no_hang();
 
     fn on_exit(&mut self, exit_code: c_int, registry: &mut EventRegistry<Self>) {
-        registry.set_exit(ExitReason::Code(exit_code));
+        self.read_exec_status(registry);
+        if !registry.got_break() {
+            registry.set_exit(ExitReason::Code(exit_code));
+        }
         self.command_pid = None;
     }
 
     fn on_term(&mut self, signal: SignalNumber, registry: &mut EventRegistry<Self>) {
-        registry.set_exit(ExitReason::Signal(signal));
+        self.read_exec_status(registry);
+        if !registry.got_break() {
+            registry.set_exit(ExitReason::Signal(signal));
+        }
         self.command_pid = None;
     }
 

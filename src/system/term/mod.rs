@@ -313,10 +313,9 @@ mod tests {
         io::{Read, Write},
         os::unix::{net::UnixStream, prelude::OsStringExt},
         path::PathBuf,
-        process::exit,
     };
 
-    use crate::system::{fork_for_test, getpgid, setsid, term::*};
+    use crate::system::{_exit as exit, fork_for_test, getpgid, setsid, term::*};
 
     #[test]
     fn open_pty() {
@@ -326,7 +325,7 @@ mod tests {
 
         let path = PathBuf::from(OsString::from_vec(pty.path.into_bytes()));
         assert!(path.try_exists().unwrap());
-        assert!(path.starts_with("/dev/pts/"));
+        assert_eq!(pty.follower.ttyname().unwrap(), path.as_os_str());
     }
 
     #[test]

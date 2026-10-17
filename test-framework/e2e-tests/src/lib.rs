@@ -1,5 +1,6 @@
 #![cfg(test)]
 
+mod background;
 mod pty;
 mod regression;
 mod su;

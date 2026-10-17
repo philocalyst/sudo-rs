@@ -8,7 +8,7 @@ use crate::system::signal::{
 use crate::{
     common::bin_serde::BinPipe,
     exec::{
-        event::{EventRegistry, Process},
+        event::{EventHandle, EventRegistry, Process},
         exec_command,
         io_util::{retry_while_interrupted, was_interrupted},
         use_pty::backchannel::{MonitorBackchannel, MonitorMessage, ParentMessage},
@@ -115,6 +115,9 @@ pub(super) fn exec_monitor(
         exec_command(command, original_set, original_signals, errpipe_tx)
     };
 
+    drop(errpipe_tx);
+    drop(command);
+
     // Send the command's PID to the parent.
     if let Err(err) = backchannel.send(&ParentMessage::CommandPid(command_pid)) {
         dev_warn!("cannot send command PID to parent: {err}");
@@ -218,6 +221,7 @@ struct MonitorClosure<'a> {
     monitor_pgrp: ProcessId,
     pty_follower: PtyFollower,
     errpipe_rx: BinPipe<i32>,
+    errpipe_handle: EventHandle,
     backchannel: &'a mut MonitorBackchannel,
     signal_stream: &'static SignalStream,
     _signal_handlers: [SignalHandler; MonitorClosure::SIGNALS.len()],
@@ -240,7 +244,7 @@ impl<'a> MonitorClosure<'a> {
         let monitor_pgrp = getpgrp();
 
         // Register the callback to receive the IO error if the command fails to execute.
-        registry.register_event(&errpipe_rx, PollEvent::Readable, |_| {
+        let errpipe_handle = registry.register_event(&errpipe_rx, PollEvent::Readable, |_| {
             MonitorEvent::ReadableErrPipe
         });
 
@@ -270,6 +274,7 @@ impl<'a> MonitorClosure<'a> {
             monitor_pgrp,
             pty_follower,
             errpipe_rx,
+            errpipe_handle,
             backchannel,
             signal_stream,
             _signal_handlers: signal_handlers,
@@ -303,10 +308,25 @@ impl<'a> MonitorClosure<'a> {
     }
 
     fn read_errpipe(&mut self, registry: &mut EventRegistry<Self>) {
+        if !self.errpipe_handle.is_active() {
+            return;
+        }
         match self.errpipe_rx.read() {
             Err(err) if was_interrupted(&err) => { /* Retry later */ }
-            Err(err) => registry.set_break(err),
+            Err(err) if err.kind() == io::ErrorKind::UnexpectedEof => {
+                self.errpipe_handle.ignore(registry);
+                if let Err(err) = self.backchannel.send(&ParentMessage::CommandStarted) {
+                    registry.set_break(err);
+                }
+            }
+            Err(err) => {
+                self.errpipe_handle.ignore(registry);
+                registry.set_break(err);
+            }
             Ok(error_code) => {
+                // This is terminal: a queued SIGCHLD/pipe callback must not
+                // reinterpret the subsequent EOF as successful exec.
+                self.errpipe_handle.ignore(registry);
                 // Received error code from the command, forward it to the parent.
                 registry.set_break(io::Error::from_raw_os_error(error_code));
             }
@@ -434,12 +454,18 @@ impl HandleSigchld for MonitorClosure<'_> {
     const OPTIONS: WaitOptions = WaitOptions::new().untraced().no_hang();
 
     fn on_exit(&mut self, exit_code: c_int, registry: &mut EventRegistry<Self>) {
-        registry.set_exit(CommandStatus::Exit(exit_code));
+        self.read_errpipe(registry);
+        if !registry.got_break() {
+            registry.set_exit(CommandStatus::Exit(exit_code));
+        }
         self.command_pid = None;
     }
 
     fn on_term(&mut self, signal: c_int, registry: &mut EventRegistry<Self>) {
-        registry.set_exit(CommandStatus::Term(signal));
+        self.read_errpipe(registry);
+        if !registry.got_break() {
+            registry.set_exit(CommandStatus::Term(signal));
+        }
         self.command_pid = None;
     }
 

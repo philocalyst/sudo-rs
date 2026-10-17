@@ -474,19 +474,12 @@ impl Terminal<'_> {
 mod test {
     use std::fs::File;
     use std::io::{Read, Write};
-    use std::os::fd::FromRawFd;
-
-    use libc::O_CLOEXEC;
 
     use super::*;
 
     fn make_pipe() -> (File, File) {
-        // SAFETY: A valid pointer to a mutable array of 2 fds is passed in.
-        unsafe {
-            let mut pipes = [-1, -1];
-            cerr(libc::pipe2(pipes.as_mut_ptr(), O_CLOEXEC)).unwrap();
-            (File::from_raw_fd(pipes[0]), File::from_raw_fd(pipes[1]))
-        }
+        let (rx, tx) = crate::cutils::pipe_cloexec().unwrap();
+        (rx.into(), tx.into())
     }
 
     #[test]
