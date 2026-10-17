@@ -670,6 +670,36 @@ fn at_sign_ambiguity() {
 }
 
 #[test]
+fn apple_stock_sudoers() {
+    // the /etc/sudoers that macOS ships, without its comments, see
+    // https://github.com/apple-oss-distributions/sudo/blob/sudo-114.100.11/files/sudoers
+    let (_, errors) = analyze(
+        Path::new("/etc/fakesudoers"),
+        sudoer![
+            "Defaults\tenv_reset",
+            "Defaults\tenv_keep += \"BLOCKSIZE\"",
+            "Defaults\tenv_keep += \"COLORFGBG COLORTERM\"",
+            "Defaults\tenv_keep += \"__CF_USER_TEXT_ENCODING\"",
+            "Defaults\tenv_keep += \"CHARSET LANG LANGUAGE LC_ALL LC_COLLATE LC_CTYPE\"",
+            "Defaults\tenv_keep += \"LC_MESSAGES LC_MONETARY LC_NUMERIC LC_TIME\"",
+            "Defaults\tenv_keep += \"LINES COLUMNS\"",
+            "Defaults\tenv_keep += \"LSCOLORS\"",
+            "Defaults\tenv_keep += \"SSH_AUTH_SOCK\"",
+            "Defaults\tenv_keep += \"TZ\"",
+            "Defaults\tenv_keep += \"DISPLAY XAUTHORIZATION XAUTHORITY\"",
+            "Defaults\tenv_keep += \"EDITOR VISUAL\"",
+            "Defaults\tenv_keep += \"HOME MAIL\"",
+            "Defaults\tlecture_file = \"/etc/sudo_lecture\"",
+            "Defaults\t!log_allowed",
+            "root\t\tALL = (ALL) ALL",
+            "%admin\t\tALL = (ALL) ALL"
+        ],
+    );
+    assert!(errors.is_empty());
+    assert!(parse_line("#includedir /private/etc/sudoers.d").is_include_dir());
+}
+
+#[test]
 fn default_specific_test() {
     let sudoers = || {
         analyze(
