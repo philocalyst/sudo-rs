@@ -15,6 +15,10 @@ pub fn run_edit(edit_opts: SudoEditOptions) -> Result<(), Error> {
         return Err(Error::Authorization(context.current_user.name.to_string()));
     };
 
+    // sudoedit runs the editor without applying a profile, so a policy that
+    // selects one is refused rather than silently edited unconfined.
+    super::ensure_apparmor_profile_supported(&controls)?;
+
     let mut pam_context = super::auth_and_update_record_file(&context, auth)?;
 
     let mut opened_files = Vec::with_capacity(context.files_to_edit.len());
