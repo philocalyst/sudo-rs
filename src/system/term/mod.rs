@@ -311,12 +311,12 @@ mod tests {
     use std::{
         ffi::OsString,
         io::{Read, Write},
-        os::unix::{net::UnixStream, prelude::OsStringExt},
+        os::unix::{fs::MetadataExt, net::UnixStream, prelude::OsStringExt},
         path::PathBuf,
         process::exit,
     };
 
-    use crate::system::{fork_for_test, getpgid, setsid, term::*};
+    use crate::system::{DeviceId, Process, WithProcess, fork_for_test, getpgid, setsid, term::*};
 
     #[test]
     fn open_pty() {
@@ -363,6 +363,36 @@ mod tests {
         drop(tx);
 
         // Read one byte from the children to confirm that it did not panic.
+        let mut buf = [0];
+        rx.read_exact(&mut buf).unwrap();
+        assert_eq!(buf[0], 42);
+    }
+
+    #[test]
+    fn tty_device_id_is_the_controlling_terminal() {
+        let (mut rx, mut tx) = UnixStream::pair().unwrap();
+
+        unsafe {
+            fork_for_test(|| {
+                let pty = Pty::open().unwrap();
+                // A new session has no controlling terminal until it acquires one.
+                setsid().unwrap();
+                assert_eq!(Process::tty_device_id(WithProcess::Current).unwrap(), None);
+
+                pty.follower.make_controlling_terminal().unwrap();
+                let follower = pty.follower.file.metadata().unwrap().rdev();
+                assert_eq!(
+                    Process::tty_device_id(WithProcess::Current).unwrap(),
+                    Some(DeviceId::new(follower as libc::dev_t))
+                );
+
+                tx.write_all(&[42]).unwrap();
+                exit(0);
+            })
+        };
+
+        drop(tx);
+
         let mut buf = [0];
         rx.read_exact(&mut buf).unwrap();
         assert_eq!(buf[0], 42);

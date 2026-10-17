@@ -178,8 +178,18 @@ mod tests {
         use crate::system::{Process, WithProcess};
         let time = Process::starting_time(WithProcess::Current).unwrap();
 
+        // Linux counts process creation from boot; FreeBSD and macOS report the time of day
+        #[cfg(target_os = "linux")]
+        let clock = libc::CLOCK_BOOTTIME;
+        #[cfg(not(target_os = "linux"))]
+        let clock = libc::CLOCK_REALTIME;
+
         let now = {
-            let super::SystemTime { secs, nsecs } = super::SystemTime::now().unwrap();
+            let mut spec = MaybeUninit::<libc::timespec>::uninit();
+            // SAFETY: valid pointer is passed to clock_gettime
+            crate::cutils::cerr(unsafe { libc::clock_gettime(clock, spec.as_mut_ptr()) }).unwrap();
+            // SAFETY: clock_gettime succeeded, so it initialized `spec`
+            let super::SystemTime { secs, nsecs } = unsafe { spec.assume_init() }.into();
             super::ProcessCreateTime { secs, nsecs }
         };
 

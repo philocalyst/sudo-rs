@@ -1,11 +1,11 @@
 //! The parts of the system interface that macOS provides in its own way.
 
-use std::{ffi::c_int, io};
+use std::{ffi::c_int, io, mem::MaybeUninit};
 
 use super::{DeviceId, Process, ProcessCreateTime, WithProcess, set_errno};
 
 /// The clock that counts the time since boot, including time spent asleep. Unlike on Linux,
-/// this is what macOS calls CLOCK_MONOTONIC.
+/// this is what macOS calls CLOCK_MONOTONIC, see clock_gettime(3).
 pub(super) const BOOTTIME: libc::clockid_t = libc::CLOCK_MONOTONIC;
 
 /// Mark the file descriptors from `lowfd` onwards as CLOEXEC.
@@ -44,7 +44,8 @@ pub(super) fn open_fds() -> io::Result<Vec<c_int>> {
             return Ok(entries.iter().map(|entry| entry.proc_fd).collect());
         }
 
-        // The table grew since it was measured, and proc_pidinfo silently truncates.
+        // The table grew since it was measured, and proc_pidinfo silently truncates,
+        // see https://github.com/apple-oss-distributions/xnu/blob/xnu-12377.121.6/bsd/kern/proc_info.c#L514-L549
         capacity *= 2;
     }
 }
@@ -52,18 +53,63 @@ pub(super) fn open_fds() -> io::Result<Vec<c_int>> {
 /// Returns the device identifier of the TTY device that is currently
 /// attached to the given process
 pub(super) fn tty_device_id(pid: WithProcess) -> std::io::Result<Option<DeviceId>> {
-    Ok(None)
+    let info = bsd_info(pid)?;
+
+    // e_tdev holds the bits of a dev_t, which is signed on macOS; without a controlling
+    // terminal, it is NODEV (-1), see https://github.com/apple-oss-distributions/xnu/blob/xnu-12377.121.6/bsd/kern/proc_info.c#L818-L826
+    match info.e_tdev as libc::dev_t {
+        -1 => Ok(None),
+        tty_device => Ok(Some(DeviceId::new(tty_device))),
+    }
 }
 
 /// Get the process starting time of a specific process
 pub(super) fn starting_time(pid: WithProcess) -> io::Result<ProcessCreateTime> {
-    Ok(ProcessCreateTime::new(0, 0))
+    let info = bsd_info(pid)?;
+
+    Ok(ProcessCreateTime::new(
+        info.pbi_start_tvsec as i64,
+        info.pbi_start_tvusec as i64 * 1000,
+    ))
+}
+
+/// The BSD-level information about a process, which is where macOS records its terminal and
+/// start time.
+fn bsd_info(pid: WithProcess) -> io::Result<libc::proc_bsdinfo> {
+    let pid = match pid {
+        WithProcess::Current => Process::process_id(),
+        WithProcess::Other(pid) => pid,
+    };
+
+    let mut info = MaybeUninit::<libc::proc_bsdinfo>::uninit();
+    let size = size_of::<libc::proc_bsdinfo>();
+    // SAFETY: the buffer has room for `size` bytes.
+    let written = proc_pidinfo_bytes(|| unsafe {
+        libc::proc_pidinfo(
+            pid.inner(),
+            libc::PROC_PIDTBSDINFO,
+            0,
+            info.as_mut_ptr().cast(),
+            size as c_int,
+        )
+    })?;
+
+    if written != size {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "proc_pidinfo returned an incomplete proc_bsdinfo",
+        ));
+    }
+
+    // SAFETY: proc_pidinfo initialized the whole structure.
+    Ok(unsafe { info.assume_init() })
 }
 
 /// Run a proc_pidinfo query, returning the number of bytes it wrote.
 ///
 /// proc_pidinfo reports failure by returning 0 and setting errno, which is not otherwise
-/// distinguishable from a successful query with nothing to report.
+/// distinguishable from a successful query with nothing to report, see
+/// https://github.com/apple-oss-distributions/xnu/blob/xnu-12377.121.6/libsyscall/wrappers/libproc/libproc.c#L101-L110
 fn proc_pidinfo_bytes(query: impl FnOnce() -> c_int) -> io::Result<usize> {
     set_errno(0);
     let written = query();
