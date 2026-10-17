@@ -121,8 +121,7 @@ pub fn run_command(
 
     let spawn_noexec_handler = if options.noexec {
         #[cfg(not(target_os = "linux"))]
-        return Err(io::Error::new(
-            io::ErrorKind::Other,
+        return Err(io::Error::other(
             "NOEXEC is currently only supported on Linux",
         ));
 
