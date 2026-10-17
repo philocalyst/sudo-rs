@@ -332,6 +332,49 @@ fn faccess_at(parent: BorrowedFd, path: &CStr, mode: c_int, flags: c_int) -> io:
     cerr(unsafe { libc::faccessat(parent.as_raw_fd(), path.as_ptr(), mode, flags) }).map(|_| ())
 }
 
+/// Whether the real user could modify `file`, which `dir` contains as `name`.
+#[cfg(not(target_os = "macos"))]
+fn real_user_can_modify(_dir: &File, _name: &CStr, file: &File) -> bool {
+    // We don't pass AT_EACCESS to faccessat to make it check using the
+    // real user id rather than the effective user id.
+    faccess_at(file.as_fd(), c"", libc::W_OK, libc::AT_EMPTY_PATH).is_ok()
+}
+
+/// Whether the real user could modify `file`, which `dir` contains as `name`.
+#[cfg(target_os = "macos")]
+fn real_user_can_modify(dir: &File, name: &CStr, _file: &File) -> bool {
+    // W_OK only holds if all the rights needed to write are granted, which for a directory means
+    // both adding files and adding subdirectories; an access control list can grant either one,
+    // or the right to delete entries, or the object itself. So ask about each right that changes
+    // the object, using the extended access bits from <sys/unistd.h>, each of which faccessat
+    // checks as exactly one right, see https://github.com/apple-oss-distributions/xnu/blob/xnu-12377.121.6/bsd/vfs/vfs_syscalls.c#L6911-L6935
+    const MODIFYING_RIGHTS: [c_int; 6] = [
+        1 << 10, // _WRITE_OK: write data, or add a file to a directory
+        1 << 12, // _DELETE_OK: delete it
+        1 << 13, // _APPEND_OK: append data, or add a subdirectory to a directory
+        1 << 14, // _RMFILE_OK: delete an entry from a directory
+        1 << 20, // _WPERM_OK: change the permissions, which can grant all of the above
+        1 << 21, // _CHOWN_OK: change the ownership
+    ];
+
+    // macOS has no AT_EMPTY_PATH, so the file is checked by its name in `dir`, which only
+    // someone who can modify `dir` could point elsewhere in the meantime. The real user cannot,
+    // as `dir` was checked first. As above, faccessat checks using the real user id.
+    MODIFYING_RIGHTS.into_iter().any(|right| {
+        match faccess_at(dir.as_fd(), name, right, libc::AT_SYMLINK_NOFOLLOW) {
+            Ok(()) => true,
+            // Only these mean that the right is withheld: from the user, by an immutable flag or
+            // by a read-only volume, see vnode_authorize in
+            // https://github.com/apple-oss-distributions/xnu/blob/xnu-12377.121.6/bsd/vfs/vfs_subr.c#L8978-L9020
+            // Any other error leaves that open, so refuse rather than overlook it.
+            Err(err) => !matches!(
+                err.raw_os_error(),
+                Some(libc::EACCES | libc::EPERM | libc::EROFS)
+            ),
+        }
+    })
+}
+
 /// This opens a file for sudoedit, performing security checks (see below) and
 /// opening with reduced privileges.
 pub fn secure_open_for_sudoedit(
@@ -381,8 +424,10 @@ fn traversed_secure_open(
         ));
     }
 
-    let user_cannot_write = |file: &File| -> io::Result<()> {
+    // checks `file`, which was opened as `name` in `dir`
+    let user_cannot_write = |dir: &File, name: &CStr, file: &File| -> io::Result<()> {
         let meta = file.metadata()?;
+        let perms = meta.permissions().mode();
 
         if meta.uid() == forbidden_user.uid.inner() {
             // Owner can change file permissions
@@ -392,25 +437,19 @@ fn traversed_secure_open(
             ));
         }
 
-        #[cfg(any(test, target_os = "macos"))]
-        let user_has_write_perms = {
+        let user_has_write_perms = if cfg!(test) {
             // During testing we do a less comprehensive check as we don't have
             // permission to set the real user id to arbitrary users, but faccessat
             // looks at the real user id.
-            let perms = meta.permissions().mode();
             perms & mode(Category::World, Op::Write) != 0
                 || (perms & mode(Category::Group, Op::Write) != 0)
                     && forbidden_user.in_group_by_gid(GroupId::new(meta.gid()))
                 || (perms & mode(Category::Owner, Op::Write) != 0)
                     && forbidden_user.uid.inner() == meta.uid()
-        };
-        #[cfg(not(any(test, target_os = "macos")))]
-        let user_has_write_perms = {
+        } else {
             // Only works when forbidden_user is current user. This is enforced
             // by accepting CurrentUser outside of test mode.
-            // We don't pass AT_EACCESS to faccessat to make it check using the
-            // real user id rather than the effective user id.
-            faccess_at(file.as_fd(), c"", libc::W_OK, libc::AT_EMPTY_PATH).is_ok()
+            real_user_can_modify(dir, name, file)
         };
 
         if user_has_write_perms {
@@ -424,7 +463,7 @@ fn traversed_secure_open(
     };
 
     let mut cur = File::open("/")?;
-    user_cannot_write(&cur)?;
+    user_cannot_write(&cur, c".", &cur)?;
 
     for component in components {
         let dir: CString = match component {
@@ -439,19 +478,20 @@ fn traversed_secure_open(
             }
         };
 
-        sudo_call(target_user, target_group, || {
-            cur = open_at(cur.as_fd(), &dir, false)?.into();
-            io::Result::Ok(())
-        })??;
-        user_cannot_write(&cur)?;
+        let next = File::from(sudo_call(target_user, target_group, || {
+            open_at(cur.as_fd(), &dir, false)
+        })??);
+        user_cannot_write(&cur, &dir, &next)?;
+        cur = next;
     }
-    sudo_call(target_user, target_group, || {
-        cur = open_at(cur.as_fd(), &CString::new(file_name.as_bytes())?, true)?.into();
-        io::Result::Ok(())
-    })??;
-    user_cannot_write(&cur)?;
 
-    Ok(cur)
+    let file_name = CString::new(file_name.as_bytes())?;
+    let file = File::from(sudo_call(target_user, target_group, || {
+        open_at(cur.as_fd(), &file_name, true)
+    })??);
+    user_cannot_write(&cur, &file_name, &file)?;
+
+    Ok(file)
 }
 
 #[cfg(test)]
