@@ -558,6 +558,7 @@ fn apple_lecture_file_default() {
     );
     assert!(diagnostics.is_empty());
 }
+
 #[test]
 fn default_multi_test() {
     let (mut sudoers, _) = analyze(

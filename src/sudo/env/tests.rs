@@ -82,6 +82,7 @@ fn create_test_context(sudo_options: SudoRunOptions) -> Context {
     let command = CommandAndArguments::build_from_args(None, sudo_options.positional_args, &path);
 
     let current_user = CurrentUser::fake(User {
+        groups_may_expand: false,
         uid: UserId::new(1000),
         gid: GroupId::new(1000),
 
@@ -97,6 +98,7 @@ fn create_test_context(sudo_options: SudoRunOptions) -> Context {
     };
 
     let root_user = User {
+        groups_may_expand: false,
         uid: UserId::ROOT,
         gid: GroupId::new(0),
         name: "root".into(),

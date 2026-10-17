@@ -126,6 +126,19 @@ pub trait UnixGroup {
     fn try_as_name(&self) -> Option<&str>;
 }
 
+#[cfg(target_os = "macos")]
+fn group_lookup_or_exit<T>(uid: UserId, lookup: std::io::Result<T>) -> T {
+    lookup.unwrap_or_else(|err| {
+        // A false result on service failure could grant a negated group rule.
+        crate::log::user_error!(
+            "unable to determine group membership for user {uid}: {error}",
+            uid = uid,
+            error = err
+        );
+        std::process::exit(1);
+    })
+}
+
 impl UnixUser for super::User {
     fn has_name(&self, name: &str) -> bool {
         self.name == name
@@ -137,14 +150,25 @@ impl UnixUser for super::User {
         self.has_uid(UserId::ROOT)
     }
     fn in_group_by_name(&self, name_c: &CStr) -> bool {
-        if let Ok(Some(group)) = super::Group::from_name(name_c) {
+        let group = super::Group::from_name(name_c);
+        #[cfg(target_os = "macos")]
+        let group = group_lookup_or_exit(self.uid, group);
+        #[cfg(not(target_os = "macos"))]
+        let group = group.ok().flatten();
+        if let Some(group) = group {
             self.in_group_by_gid(group.gid)
         } else {
             false
         }
     }
     fn in_group_by_gid(&self, gid: GroupId) -> bool {
-        self.groups.contains(&gid)
+        if self.groups.contains(&gid) {
+            return true;
+        }
+        #[cfg(target_os = "macos")]
+        return group_lookup_or_exit(self.uid, super::macos::is_group_member(self.uid, gid));
+        #[cfg(not(target_os = "macos"))]
+        false
     }
     type Group = super::Group;
     fn group(&self) -> super::Group {
@@ -169,6 +193,32 @@ mod test {
     use super::*;
     use crate::system::{Group, ROOT_GROUP_NAME, User};
     use std::ffi::CString;
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn membership_service_failure_stops_authorization() {
+        const CHILD: &str = "SUDO_RS_TEST_MEMBERSHIP_FAILURE";
+        if std::env::var_os(CHILD).is_some() {
+            group_lookup_or_exit::<bool>(
+                UserId::new(501),
+                Err(std::io::Error::from_raw_os_error(libc::EIO)),
+            );
+            crate::system::_exit(0);
+        }
+        // Exercise the real termination path in a fresh process, without
+        // inheriting another test thread's runtime cleanup locks through fork.
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "system::interface::test::membership_service_failure_stops_authorization",
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .output()
+            .unwrap()
+            .status;
+        assert_eq!(status.code(), Some(1));
+    }
 
     fn test_user(user: impl UnixUser, name_c: &CStr) {
         let name = name_c.to_str().unwrap();

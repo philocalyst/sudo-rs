@@ -65,7 +65,37 @@ impl CurrentUser {
     pub fn resolve() -> Result<Self, Error> {
         let mut cur_user = User::real()?.ok_or(Error::UserNotFound("current user".to_string()))?;
         // the current user can also have groups that are defined at runtime, so fetch the dynamic groups
-        cur_user.groups = User::real_groups()?;
+        let runtime_groups = User::real_groups()?;
+
+        #[cfg(not(target_os = "macos"))]
+        let use_runtime_groups = true;
+
+        // Darwin keeps at most sixteen groups in a process credential and
+        // resolves anything beyond them through Open Directory -- unless the
+        // credential was pinned with `setgroups`, after which the entries the
+        // kernel holds are the whole truth.
+        //
+        // A runtime group that is not one of the account's own memberships can
+        // only have come from such a call, so it is the observable trace of a
+        // pinned credential: take the runtime list as given and stop expanding
+        // it. Without that trace the account is running normally, and its own
+        // memberships are the fuller answer.
+        #[cfg(target_os = "macos")]
+        let use_runtime_groups = {
+            let mut credential_is_pinned = false;
+            for gid in &runtime_groups {
+                if !crate::system::macos::is_group_member(cur_user.uid, *gid)? {
+                    credential_is_pinned = true;
+                    break;
+                }
+            }
+            credential_is_pinned
+        };
+
+        if use_runtime_groups {
+            cur_user.groups = runtime_groups;
+            cur_user.use_explicit_groups();
+        }
         Ok(Self { inner: cur_user })
     }
 }

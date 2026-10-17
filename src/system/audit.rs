@@ -15,7 +15,8 @@ use std::os::unix::{
 use std::path::{Component, Path};
 
 use super::{
-    Group, GroupId, User, UserId, cerr, inject_group, interface::UnixUser, set_supplementary_groups,
+    Group, GroupId, User, UserId, cerr, inject_group, interface::UnixUser,
+    set_supplementary_groups, set_user_groups,
 };
 use crate::common::resolve::CurrentUser;
 
@@ -61,6 +62,10 @@ pub(crate) fn sudo_call<T>(
     {
         let same_groups = target_groups.iter().collect::<HashSet<_>>()
             == cur_groups.iter().collect::<HashSet<_>>();
+        #[cfg(target_os = "macos")]
+        let same_groups = same_groups
+            || (target_user.groups_may_expand
+                && cur_groups.iter().all(|gid| target_groups.contains(gid)));
         if target_user.uid == cur_user_id && target_group.gid == cur_group_id && same_groups {
             // Tests can open files as themselves without privileged setgroups.
             return Ok(operation());
@@ -71,7 +76,28 @@ pub(crate) fn sudo_call<T>(
     // only `initgroups` keeps Open Directory membership resolution switched on.
     // The current group list has to be one that account would be given, or
     // `initgroups` would hand back a different set than it took away.
-    struct ResetUserGuard(UserId, GroupId, Vec<GroupId>);
+    // A failure here stops before any credential has changed; guessing would
+    // leave the process pinned to a `setgroups` list for the rest of its life.
+    #[cfg(target_os = "macos")]
+    let restore_account = {
+        let mut account = User::real().map_err(|err| io::Error::other(err.to_string()))?;
+        if let Some(user) = &account {
+            for gid in &cur_groups {
+                if !super::macos::is_group_member(user.uid, *gid)? {
+                    account = None;
+                    break;
+                }
+            }
+        }
+        account
+    };
+
+    struct ResetUserGuard(
+        UserId,
+        GroupId,
+        Vec<GroupId>,
+        #[cfg(target_os = "macos")] Option<User>,
+    );
 
     impl Drop for ResetUserGuard {
         fn drop(&mut self) {
@@ -81,15 +107,27 @@ pub(crate) fn sudo_call<T>(
                 cerr(unsafe { libc::seteuid(UserId::inner(&self.0)) })?;
                 // SAFETY: this function is always safe to call
                 cerr(unsafe { libc::setegid(GroupId::inner(&self.1)) })?;
+                #[cfg(target_os = "macos")]
+                if let Some(user) = &self.3 {
+                    let mut groups = self.2.clone();
+                    inject_group(self.1, &mut groups);
+                    return set_user_groups(user, &groups);
+                }
                 set_supplementary_groups(&self.2)
             })()
             .expect("could not restore to saved user id");
         }
     }
 
-    let guard = ResetUserGuard(cur_user_id, cur_group_id, cur_groups);
+    let guard = ResetUserGuard(
+        cur_user_id,
+        cur_group_id,
+        cur_groups,
+        #[cfg(target_os = "macos")]
+        restore_account,
+    );
 
-    set_supplementary_groups(&target_groups)?;
+    set_user_groups(target_user, &target_groups)?;
     // SAFETY: this function is always safe to call
     cerr(unsafe { libc::setegid(GroupId::inner(&target_group.gid)) })?;
     // SAFETY: this function is always safe to call
@@ -565,6 +603,7 @@ mod test {
 
         let user = CurrentUser::resolve().unwrap();
         let other_user = CurrentUser::fake(User {
+            groups_may_expand: false,
             uid: UserId::new(1042),
             gid: GroupId::new(1042),
 
