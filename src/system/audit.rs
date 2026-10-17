@@ -33,7 +33,6 @@ pub(crate) fn sudo_call<T>(
     target_group: &Group,
     operation: impl FnOnce() -> T,
 ) -> io::Result<T> {
-    const KEEP_UID: libc::uid_t = -1i32 as libc::uid_t;
     const KEEP_GID: libc::gid_t = -1i32 as libc::gid_t;
 
     // SAFETY: these libc functions are always safe to call
@@ -75,9 +74,9 @@ pub(crate) fn sudo_call<T>(
             // restore privileges in reverse order
             (|| {
                 // SAFETY: this function is always safe to call
-                cerr(unsafe { libc::setreuid(KEEP_UID, UserId::inner(&self.0)) })?;
+                cerr(unsafe { libc::seteuid(UserId::inner(&self.0)) })?;
                 // SAFETY: this function is always safe to call
-                cerr(unsafe { libc::setregid(KEEP_GID, GroupId::inner(&self.1)) })?;
+                cerr(unsafe { libc::setegid(GroupId::inner(&self.1)) })?;
                 set_supplementary_groups(&self.2)
             })()
             .expect("could not restore to saved user id");
@@ -86,11 +85,12 @@ pub(crate) fn sudo_call<T>(
 
     let guard = ResetUserGuard(cur_user_id, cur_group_id, cur_groups);
 
+    // Only the effective ids change, so the saved set-user-ID still allows switching back.
     set_supplementary_groups(&target_groups)?;
     // SAFETY: this function is always safe to call
-    cerr(unsafe { libc::setregid(KEEP_GID, GroupId::inner(&target_group.gid)) })?;
+    cerr(unsafe { libc::setegid(GroupId::inner(&target_group.gid)) })?;
     // SAFETY: this function is always safe to call
-    cerr(unsafe { libc::setreuid(KEEP_UID, UserId::inner(&target_user.uid)) })?;
+    cerr(unsafe { libc::seteuid(UserId::inner(&target_user.uid)) })?;
 
     let result = operation();
 
