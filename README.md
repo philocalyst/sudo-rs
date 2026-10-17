@@ -13,7 +13,7 @@ Suspected vulnerabilities can be reported on our [security page](https://github.
 
 Sudo-rs has been audited twice: an audit of version 0.2.0 was performed in August 2023, and a second audit of version 0.2.8 in August 2025. The audit reports can be found [here](docs/audit).
 
-Sudo-rs currently is targeted for FreeBSD and Linux-based operating systems only.
+Sudo-rs currently is targeted for FreeBSD and Linux-based operating systems, with experimental support for macOS.
 
 ## Installing sudo-rs
 
@@ -98,6 +98,26 @@ Installs the commands as `sudo-rs`, `visudo-rs`' and `sudoedit-rs` and does not 
 To run these commands, the `pkg` utility needs to be using the `2025Q4` quarterly version (or later) of the ports tree. To use the
 absolute latest version, you can [switch from quarterly to `latest`](https://wiki.freebsd.org/Ports/QuarterlyBranch#How_to_switch_from_quarterly_to_latest).
 
+### macOS
+
+There is no package for macOS yet, so build sudo-rs from source as described
+below; the Xcode command line tools provide everything it needs. To use it next to
+the sudo that macOS ships, install it under other names, in a directory that only
+root can write to. That excludes `/usr/local/bin` if Homebrew is installed there.
+
+```sh
+sudo install -o root -g wheel -m 4755 target/release/sudo /usr/local/bin/sudo-rs
+sudo install -o root -g wheel -m 4755 target/release/su /usr/local/bin/su-rs
+sudo install -o root -g wheel -m 755 target/release/visudo /usr/local/bin/visudo-rs
+```
+
+sudo-rs reads `/etc/sudoers-rs` if it exists and the `/etc/sudoers` that macOS
+ships otherwise, and authenticates through the `sudo` and `su` PAM services of
+macOS, including Touch ID if `/etc/pam.d/sudo_local` enables it. `NOEXEC:` and
+AppArmor profiles are not available on macOS. For translations, the `gettext`
+feature needs a libintl that only root can modify, such as the one from MacPorts
+or Nix: unlike Homebrew's, which belongs to the user who installed Homebrew.
+
 ### NixOS
 
 On NixOS sudo-rs can be installed by adding the following to your configuration:
@@ -180,7 +200,8 @@ If you **don't** have Todd Miller's `sudo` installed, you also have to make sure
 Sudo-rs is written in Rust. The minimum required Rust version is 1.85. If your
 Linux distribution does not package that version (or a later one), you can always
 install the most recent version through [rustup]. You also need the C development
-files for PAM (`libpam0g-dev` on Debian, `pam-devel` on Fedora). If you want to
+files for PAM (`libpam0g-dev` on Debian, `pam-devel` on Fedora, part of the Xcode
+command line tools on macOS). If you want to
 install translated messages, you also need gettext tools for `msgfmt` (`gettext`
 on Debian and Ubuntu).
 

@@ -114,11 +114,11 @@ Trifecta Tech projects that are "re-implementations" typically respect the origi
 
 ## What operating systems does sudo-rs support?
 
-sudo-rs is fully supported for reasonably modern Linux systems, as well as on FreeBSD.
+sudo-rs is fully supported for reasonably modern Linux systems, as well as on FreeBSD. Support for macOS is experimental.
 
-There are some small differences. For example, on FreeBSD, `NOEXEC:` is not supported (since it can't really be implemented with the same level of guarantees as on Linux). Our compliance testing framework comparing `sudo-rs` to `sudo` is also executed on both platforms.
+There are some small differences. For example, on FreeBSD and macOS, `NOEXEC:` is not supported (since it can't really be implemented with the same level of guarantees as on Linux). Our compliance testing framework comparing `sudo-rs` to `sudo` is also executed on Linux and FreeBSD; on macOS, the setuid binaries are tested on the system itself.
 
-In the future, we would also like to support MacOS and be able to say "of course it runs on NetBSD!", but right now we have prioritized other tasks. Patches are welcome!
+In the future, we would also like to be able to say "of course it runs on NetBSD!", but right now we have prioritized other tasks. Patches are welcome!
 
 ## Why doesn't sudo-rs insult me when I mistype my password?
 
