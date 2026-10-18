@@ -135,7 +135,9 @@ pub(crate) unsafe fn fork() -> io::Result<ForkResult> {
 /// In a multithreaded program, only async-signal-safe functions are guaranteed to work in the
 /// child process until a call to `execve` or a similar function is done.
 #[cfg(test)]
-unsafe fn fork_for_test(child_func: impl FnOnce() -> std::convert::Infallible) -> ProcessId {
+pub(crate) unsafe fn fork_for_test(
+    child_func: impl FnOnce() -> std::convert::Infallible,
+) -> ProcessId {
     use std::io::Write;
     use std::panic::{AssertUnwindSafe, catch_unwind};
     use std::process::exit;
