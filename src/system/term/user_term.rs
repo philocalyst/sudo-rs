@@ -10,6 +10,10 @@ use std::{
     sync::atomic::{AtomicBool, Ordering},
 };
 
+#[cfg(not(target_os = "freebsd"))]
+use libc::IUTF8;
+#[cfg(target_os = "linux")]
+use libc::OLCUC;
 use libc::{
     CS7, CS8, ECHO, ECHOCTL, ECHOE, ECHOK, ECHOKE, ECHONL, ICANON, ICRNL, IEXTEN, IGNCR, IGNPAR,
     IMAXBEL, INLCR, INPCK, ISIG, ISTRIP, IXANY, IXOFF, IXON, NOFLSH, OCRNL, ONLCR, ONLRET, ONOCR,
@@ -18,10 +22,8 @@ use libc::{
     sigemptyset, sighandler_t, siginfo_t, sigset_t, tcflag_t, tcgetattr, tcsetattr, termios,
     winsize,
 };
-#[cfg(target_os = "linux")]
-use libc::{IUTF8, OLCUC};
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(target_os = "freebsd")]
 const IUTF8: libc::tcflag_t = 0;
 #[cfg(not(target_os = "linux"))]
 const OLCUC: libc::tcflag_t = 0;

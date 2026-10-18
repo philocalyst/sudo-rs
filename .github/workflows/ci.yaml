@@ -195,6 +195,7 @@ jobs:
           persist-credentials: false
 
       - name: Correct permissions
+        if: matrix.os == 'ubuntu-latest'
         run: sudo chmod -R 755 /usr/share
 
       - name: Install llvm-tools component
@@ -219,6 +220,23 @@ jobs:
 
       - name: Run tests
         run: cargo test --workspace --all-targets --release
+
+  macos-native:
+    runs-on: macos-latest
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Register rust problem matcher
+        run: echo "::add-matcher::.github/problem-matchers/rust.json"
+
+      - name: Build
+        run: cargo build --release --bins
+
+      - name: Run the setuid binaries
+        run: util/test-macos-native.sh target/release
 
   build-and-test-minimal:
     runs-on: ubuntu-latest
@@ -435,7 +453,12 @@ jobs:
 
   clippy:
     needs: format
-    runs-on: ubuntu-latest
+    runs-on: "${{ matrix.os }}"
+    strategy:
+      matrix:
+        include:
+          - os: ubuntu-latest
+          - os: macos-latest
     env:
       RUSTDOCFLAGS: "-D warnings"
     steps:

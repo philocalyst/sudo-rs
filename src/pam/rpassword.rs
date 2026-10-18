@@ -320,10 +320,10 @@ impl<'a> TimeoutRead<'a> {
 
 impl TimeoutRead<'_> {
     fn read_byte(&mut self) -> io::Result<Option<u8>> {
-        #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+        #[cfg(not(target_os = "macos"))]
         let pollmask = libc::POLLIN | libc::POLLRDHUP;
+        // macOS has no POLLRDHUP, but reports a peer that stopped writing with POLLIN and POLLHUP
         #[cfg(target_os = "macos")]
-        // "POLLRDHUP is not supported on MacOS"
         let pollmask = libc::POLLIN;
 
         let mut pollfd = [libc::pollfd {
@@ -356,7 +356,8 @@ impl TimeoutRead<'_> {
             )
         })?;
 
-        // There may yet be data waiting to be read even if POLLHUP is set.
+        // There may yet be data waiting to be read even if POLLHUP is set, and reading reports
+        // why a descriptor is invalid (POLLNVAL).
         if pollfd[0].revents & (pollmask | libc::POLLHUP | libc::POLLNVAL) > 0 {
             let mut buf = [0u8];
 
@@ -478,19 +479,12 @@ impl Terminal<'_> {
 mod test {
     use std::fs::File;
     use std::io::{Read, Write};
-    use std::os::fd::FromRawFd;
-
-    use libc::O_CLOEXEC;
 
     use super::*;
 
     fn make_pipe() -> (File, File) {
-        // SAFETY: A valid pointer to a mutable array of 2 fds is passed in.
-        unsafe {
-            let mut pipes = [-1, -1];
-            cerr(libc::pipe2(pipes.as_mut_ptr(), O_CLOEXEC)).unwrap();
-            (File::from_raw_fd(pipes[0]), File::from_raw_fd(pipes[1]))
-        }
+        let (read, write) = crate::cutils::pipe().unwrap();
+        (read.into(), write.into())
     }
 
     #[test]
