@@ -328,7 +328,6 @@ fn permission_test() {
     pass!(["ALL ALL=/foo/command --bar=1"], "user" => request! { root, root }, "server"; "/foo/command --bar=1");
 
     // apparmor
-    #[cfg(feature = "apparmor")]
     pass!(["ALL ALL=(ALL:ALL) APPARMOR_PROFILE=unconfined ALL"], "user" => root(), "server"; "/bin/bar" => [apparmor_profile: Some("unconfined".to_string())]);
 
     // list
@@ -697,6 +696,60 @@ fn apple_stock_sudoers() {
     );
     assert!(errors.is_empty());
     assert!(parse_line("#includedir /private/etc/sudoers.d").is_include_dir());
+}
+
+#[test]
+fn apparmor_profile_follows_the_matching_rule() {
+    let profile = |lines: &[&str], command: &str| {
+        let (mut sudoers, _) = analyze(
+            Path::new("/etc/fakesudoers"),
+            parse_lines(&mut CharStream::new(&[lines, &[""]].concat().join("\n")))
+                .into_iter()
+                .map(|x| Ok::<_, basic_parser::Status>(x.unwrap())),
+        );
+        let request = Request {
+            user: &Named("root"),
+            group: &Named("root"),
+            command: Path::new(command),
+            arguments: &[],
+        };
+        let judgement = sudoers.check(&Named("user"), &system::Hostname::fake("server"), request);
+        let Authorization::Allowed(_, restrictions) = judgement.authorization() else {
+            panic!("{command} should be allowed");
+        };
+        restrictions.apparmor_profile
+    };
+
+    let rule = "user ALL=(ALL:ALL) ALL";
+    let default = "Defaults apparmor_profile=default";
+    let foo_default = "Defaults!/bin/foo apparmor_profile=foo";
+
+    assert_eq!(profile(&[rule], "/bin/foo"), None);
+    assert_eq!(
+        profile(&[default, rule], "/bin/foo").as_deref(),
+        Some("default")
+    );
+    assert_eq!(
+        profile(
+            &[default, "user ALL=(ALL:ALL) APPARMOR_PROFILE=tag ALL"],
+            "/bin/foo"
+        )
+        .as_deref(),
+        Some("tag")
+    );
+    assert_eq!(
+        profile(&[foo_default, rule], "/bin/foo").as_deref(),
+        Some("foo")
+    );
+    assert_eq!(profile(&[foo_default, rule], "/bin/bar"), None);
+    // the last matching rule decides, so a profile on an earlier one does not apply
+    assert_eq!(
+        profile(
+            &["user ALL=(ALL:ALL) APPARMOR_PROFILE=tag /bin/foo", rule],
+            "/bin/foo"
+        ),
+        None
+    );
 }
 
 #[test]

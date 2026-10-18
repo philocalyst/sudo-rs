@@ -1,3 +1,4 @@
+mod background;
 mod event;
 mod io_util;
 mod no_pty;
@@ -24,9 +25,9 @@ use crate::{
     exec::no_pty::exec_no_pty,
     log::{dev_info, dev_warn, user_error},
     system::{
-        _exit, ForkResult, Group, User, fork,
+        _exit, Group, User,
         interface::{GroupId, ProcessId},
-        kill, killpg, mark_fds_as_cloexec, set_target_user, setpgid,
+        kill, killpg, mark_fds_as_cloexec, set_target_user,
         signal::{SignalNumber, SignalSet, SignalsState, consts::*, exit_with_signal, signal_name},
         term::UserTerm,
         wait::{Wait, WaitError, WaitOptions},
@@ -34,8 +35,9 @@ use crate::{
 };
 
 use self::{
-    event::{EventRegistry, Process},
-    io_util::was_interrupted,
+    background::Background,
+    event::{EventHandle, EventRegistry, PollEvent, Process},
+    io_util::{retry_while_interrupted, was_interrupted},
     use_pty::{SIGCONT_BG, SIGCONT_FG, exec_pty},
 };
 
@@ -85,19 +87,6 @@ pub fn run_command(
     options: RunOptions<'_>,
     env: impl IntoIterator<Item = (impl AsRef<OsStr>, impl AsRef<OsStr>)>,
 ) -> io::Result<ExitReason> {
-    if options.background {
-        // SAFETY: There should be no other threads at this point.
-        match unsafe { fork() }? {
-            ForkResult::Parent(_) => process::exit(0),
-            ForkResult::Child => {
-                // Child continues in an orphaned process group.
-                // Reads from the terminal fail with EIO.
-                // Writes succeed unless tostop is set on the terminal.
-                setpgid(ProcessId::new(0), ProcessId::new(0))?;
-            }
-        }
-    }
-
     // FIXME: should we pipe the stdio streams?
     let qualified_path = options.command;
     let mut command = Command::new(qualified_path);
@@ -194,6 +183,14 @@ pub fn run_command(
         });
     }
 
+    // Detach only now, so that an error in preparing the command is reported before anything runs
+    // in the background.
+    let background = if options.background {
+        Some(background::detach()?)
+    } else {
+        None
+    };
+
     let sudo_pid = ProcessId::new(std::process::id() as i32);
 
     if options.use_pty {
@@ -204,15 +201,15 @@ pub fn run_command(
                 command,
                 user_tty,
                 options.user,
-                options.background,
+                background,
             ),
             Err(err) => {
                 dev_info!("Could not open user's terminal, not allocating a pty: {err}");
-                exec_no_pty(sudo_pid, spawn_noexec_handler, command)
+                exec_no_pty(sudo_pid, spawn_noexec_handler, command, background)
             }
         }
     } else {
-        exec_no_pty(sudo_pid, spawn_noexec_handler, command)
+        exec_no_pty(sudo_pid, spawn_noexec_handler, command, background)
     }
 }
 
@@ -272,6 +269,86 @@ fn exec_command(
 
     // We call `_exit` instead of `exit` to avoid flushing the parent's IO streams by accident.
     _exit(1);
+}
+
+/// The receiving end of the pipe that [`exec_command`] reports to.
+///
+/// The command process sends the error that kept it from executing the command. Otherwise, as its
+/// end of the pipe is close-on-exec and the supervisor keeps no copy of it, the pipe reaches its
+/// end once the command is executed (or once the command process is gone). Original sudo reads
+/// its error pipe the same way, see `errpipe_cb` in
+/// <https://github.com/sudo-project/sudo/blob/84e7ca6752a2d3a32452adee177d1f57421dd814/src/exec_nopty.c#L74-L116>.
+struct ErrPipe {
+    /// `None` once the command process has reported.
+    rx: Option<BinPipe<i32>>,
+    event: EventHandle,
+    error: Option<io::Error>,
+    /// Passes on that the command was executed when running in the background.
+    background: Option<Background>,
+}
+
+impl ErrPipe {
+    /// Poll the pipe, producing `event` when the command process has reported.
+    fn new<T: Process>(
+        rx: BinPipe<i32>,
+        background: Option<Background>,
+        registry: &mut EventRegistry<T>,
+        event: T::Event,
+    ) -> Self {
+        let event = registry.register_event(&rx, PollEvent::Readable, move |_| event);
+
+        Self {
+            rx: Some(rx),
+            event,
+            error: None,
+            background,
+        }
+    }
+
+    /// Read the report of the command process, waiting for it if it has not arrived yet.
+    fn read<T: Process>(&mut self, registry: &mut EventRegistry<T>) -> io::Result<()> {
+        let Some(rx) = &mut self.rx else {
+            return Ok(());
+        };
+
+        match rx.read() {
+            Ok(error_code) => self.error = Some(io::Error::from_raw_os_error(error_code)),
+            Err(err) if err.kind() == io::ErrorKind::UnexpectedEof => {
+                if let Some(background) = self.background.take() {
+                    background.report_executed();
+                }
+            }
+            Err(err) => return Err(err),
+        }
+
+        // A pipe at its end remains readable, so stop polling it.
+        self.event.ignore(registry);
+        self.rx = None;
+        Ok(())
+    }
+
+    /// Stop the event loop now that the command process has terminated with `status`.
+    ///
+    /// If the command process reported that it could not execute the command, its exit status
+    /// only follows from that, so the loop stops with the reported error instead. Reading the
+    /// report cannot block anymore: the command process held the only other end of the pipe. This
+    /// way it does not matter which of the two the event loop learns of first, as in
+    /// `handle_sigchld_nopty` of original sudo:
+    /// <https://github.com/sudo-project/sudo/blob/84e7ca6752a2d3a32452adee177d1f57421dd814/src/exec_nopty.c#L807-L811>.
+    fn command_terminated<T: Process<Break = io::Error>>(
+        &mut self,
+        status: T::Exit,
+        registry: &mut EventRegistry<T>,
+    ) {
+        if let Err(err) = retry_while_interrupted(|| self.read(registry)) {
+            return registry.set_break(err);
+        }
+
+        match self.error.take() {
+            Some(err) => registry.set_break(err),
+            None => registry.set_exit(status),
+        }
+    }
 }
 
 // Kill the process with increasing urgency.
@@ -354,4 +431,146 @@ const fn cond_fmt<'a>(cond: bool, true_s: &'a str, false_s: &'a str) -> &'a str 
 
 const fn opt_fmt(cond: bool, s: &str) -> &str {
     cond_fmt(cond, s, "")
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        io::{self, Read, Write},
+        os::unix::net::UnixStream,
+        path::Path,
+    };
+
+    use super::{
+        ErrPipe, RunOptions, Umask,
+        background::Background,
+        event::{EventRegistry, Process, StopReason},
+        run_command,
+    };
+    use crate::{
+        common::bin_serde::BinPipe,
+        system::{
+            _exit, User, fork_for_test,
+            wait::{Wait, WaitOptions},
+        },
+    };
+
+    /// A supervisor that only waits for the command process to terminate.
+    struct Supervisor;
+
+    impl Process for Supervisor {
+        type Event = ();
+        type Break = io::Error;
+        type Exit = i32;
+
+        fn on_event(&mut self, (): (), _registry: &mut EventRegistry<Self>) {
+            panic!("the error pipe is still being polled")
+        }
+    }
+
+    /// Supervise a command process that sends `report` over its error pipe and exits with status
+    /// 1, reading the pipe before learning of the exit or not. Returns how the event loop stops,
+    /// and whether the invoking process of `sudo -b` is told that the command was executed.
+    fn supervise(report: Option<i32>, read_first: bool) -> (StopReason<Supervisor>, bool) {
+        let (background, mut invoking) = Background::pair().unwrap();
+        let (mut tx, rx) = BinPipe::pair().unwrap();
+        let mut registry = EventRegistry::new();
+        let mut errpipe = ErrPipe::new(rx, Some(background), &mut registry, ());
+
+        if let Some(error_code) = report {
+            tx.write(&error_code).unwrap();
+        }
+        drop(tx);
+
+        if read_first {
+            errpipe.read(&mut registry).unwrap();
+        }
+        errpipe.command_terminated(1, &mut registry);
+
+        // The supervisor never closes its end, so reading anything but a report would block.
+        invoking.set_nonblocking(true).unwrap();
+        let executed = invoking.read(&mut [0]).is_ok_and(|len| len == 1);
+
+        (registry.event_loop(&mut Supervisor), executed)
+    }
+
+    #[test]
+    fn exec_error_outranks_exit_status() {
+        for read_first in [true, false] {
+            let (StopReason::Break(err), false) = supervise(Some(libc::ENOENT), read_first) else {
+                panic!("the exec error was lost (read first: {read_first})");
+            };
+            assert_eq!(err.raw_os_error(), Some(libc::ENOENT));
+        }
+    }
+
+    #[test]
+    fn executed_command_exits_with_its_status() {
+        for read_first in [true, false] {
+            let (StopReason::Exit(1), true) = supervise(None, read_first) else {
+                panic!("the command was not reported as executed (read first: {read_first})");
+            };
+        }
+    }
+
+    /// Run `command` in the background from a child process, which stands in for the invoking
+    /// process. Returns how that exits, and whether run_command failed where it returned: in the
+    /// background sudo, or in the invoking process if it did not detach, which then exits with 42.
+    fn run_in_background(command: &Path, noexec: bool) -> (Option<i32>, bool) {
+        let user = User::real().unwrap().unwrap();
+        let group = user.primary_group().unwrap();
+        let (mut rx, mut tx) = UnixStream::pair().unwrap();
+
+        // SAFETY: Not really safe, but this is test only code.
+        let invoking = unsafe {
+            fork_for_test(|| {
+                let result = run_command(
+                    RunOptions {
+                        command,
+                        arguments: &[],
+                        arg0: None,
+                        chdir: None,
+                        is_login: false,
+                        user: &user,
+                        group: &group,
+                        umask: Umask::Preserve,
+                        background: true,
+                        use_pty: false,
+                        noexec,
+                        groups: None,
+                    },
+                    std::iter::empty::<(&str, &str)>(),
+                );
+                tx.write_all(&[u8::from(result.is_err())]).unwrap();
+                _exit(42)
+            })
+        };
+        drop(tx);
+
+        let (_, status) = invoking.wait(WaitOptions::new()).unwrap();
+        let mut failed = [0];
+        rx.read_exact(&mut failed)
+            .expect("run_command did not return");
+        (status.exit_status(), failed == [1])
+    }
+
+    #[test]
+    fn background_command_that_cannot_be_executed_fails() {
+        // The command does not exist, and without privileges setting its groups already fails.
+        let (status, failed) = run_in_background(Path::new("/nonexistent/command"), false);
+        assert!(failed, "the background sudo executed the command");
+        assert_eq!(status, Some(1));
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    #[test]
+    fn unsupported_noexec_is_refused_before_backgrounding() {
+        let (status, failed) = run_in_background(Path::new("/usr/bin/true"), true);
+        assert!(failed);
+        assert_eq!(
+            status,
+            Some(42),
+            "only the background sudo refused the command"
+        );
+    }
 }

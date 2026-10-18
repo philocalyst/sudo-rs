@@ -1,4 +1,4 @@
-use sudo_test::{Command, Env};
+use sudo_test::{Command, Env, TextFile};
 
 use crate::SUDOERS_ALL_ALL_NOPASSWD;
 
@@ -25,6 +25,57 @@ fn runs_in_background() {
         ])
         .output(&env)
         .assert_success();
+}
+
+const UNEXECUTABLE: &str = "/tmp/bad-interpreter";
+
+/// A command whose interpreter does not exist, so that executing it fails.
+fn env_with_unexecutable_command(sudoers: impl Into<TextFile>) -> Env {
+    Env(sudoers)
+        .file(
+            UNEXECUTABLE,
+            TextFile("#!/nonexistent/interpreter").chmod("755"),
+        )
+        .build()
+}
+
+#[test]
+fn reports_command_that_cannot_be_executed() {
+    let env = env_with_unexecutable_command(SUDOERS_ALL_ALL_NOPASSWD);
+
+    let output = Command::new("sudo").args(["-b", UNEXECUTABLE]).output(&env);
+
+    if sudo_test::is_original_sudo() {
+        // Original sudo exits successfully as soon as it has forked.
+        output.assert_success();
+    } else {
+        output.assert_exit_code(1);
+        assert_contains!(output.stderr(), "cannot execute '/tmp/bad-interpreter'");
+    }
+}
+
+#[test]
+fn reports_command_that_cannot_be_executed_in_pty() {
+    let env = env_with_unexecutable_command([SUDOERS_ALL_ALL_NOPASSWD, "Defaults use_pty"]);
+
+    let output = Command::new("bash")
+        .args([
+            "-c",
+            &format!("sudo -b {UNEXECUTABLE}; a=$?; sleep .1; exit $a"),
+        ])
+        .tty(true)
+        .output(&env);
+
+    if sudo_test::is_original_sudo() {
+        // Original sudo exits successfully as soon as it has forked.
+        output.assert_success();
+    } else {
+        output.assert_exit_code(1);
+        assert_contains!(
+            output.stdout_unchecked(),
+            "cannot execute '/tmp/bad-interpreter'"
+        );
+    }
 }
 
 #[test]
