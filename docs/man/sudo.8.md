@@ -48,8 +48,10 @@ are introduced.
 : Ring the bell as part of the password prompt when a terminal is present.
 
 `-b`, `--background`
-:   Run the given *command* in the background. It is not possible to use shell
-    job control to manipulate background processes started by sudo-rs. Most
+:   Run the given *command* in the background. sudo-rs exits as soon as the
+    *command* has been executed, without waiting for it to finish, and fails if
+    the *command* cannot be executed. It is not possible to use shell job
+    control to manipulate background processes started by sudo-rs. Most
     interactive *command*s will fail to work properly in background mode.
 
 `-D` *directory*, `--chdir`=*directory*

@@ -9,6 +9,7 @@ use crate::{
     common::bin_serde::BinPipe,
     exec::{
         ErrPipe,
+        background::Background,
         event::{EventRegistry, Process},
         exec_command,
         io_util::{retry_while_interrupted, was_interrupted},
@@ -39,6 +40,7 @@ pub(super) fn exec_monitor(
     pty_follower: PtyFollower,
     command: Command,
     foreground: bool,
+    background: Option<Background>,
     backchannel: &mut MonitorBackchannel,
     original_set: Option<SignalSet>,
     mut original_signals: SignalsState,
@@ -129,6 +131,7 @@ pub(super) fn exec_monitor(
         command_pid,
         pty_follower,
         errpipe_rx,
+        background,
         backchannel,
         &mut registry,
         &mut original_signals,
@@ -235,6 +238,7 @@ impl<'a> MonitorClosure<'a> {
         command_pid: ProcessId,
         pty_follower: PtyFollower,
         errpipe_rx: BinPipe<i32>,
+        background: Option<Background>,
         backchannel: &'a mut MonitorBackchannel,
         registry: &mut EventRegistry<Self>,
         original_signals: &mut SignalsState,
@@ -243,7 +247,12 @@ impl<'a> MonitorClosure<'a> {
         let monitor_pgrp = getpgrp();
 
         // Register the callback to receive the IO error if the command fails to execute.
-        let errpipe = ErrPipe::new(errpipe_rx, registry, MonitorEvent::ReadableErrPipe);
+        let errpipe = ErrPipe::new(
+            errpipe_rx,
+            background,
+            registry,
+            MonitorEvent::ReadableErrPipe,
+        );
 
         // Enable nonblocking assertions as we will poll this inside the event loop.
         backchannel.set_nonblocking_assertions(true);

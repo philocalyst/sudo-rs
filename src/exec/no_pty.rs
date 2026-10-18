@@ -2,6 +2,7 @@ use std::{ffi::c_int, io, process::Command};
 
 use super::{
     ErrPipe, ExitReason, HandleSigchld,
+    background::Background,
     event::PollEvent,
     event::{EventRegistry, Process, StopReason},
     io_util::was_interrupted,
@@ -30,6 +31,7 @@ pub(super) fn exec_no_pty(
     sudo_pid: ProcessId,
     spawn_noexec_handler: Option<SpawnNoexecHandler>,
     command: Command,
+    background: Option<Background>,
 ) -> io::Result<ExitReason> {
     // FIXME (ogsudo): Initialize the policy plugin's session here.
 
@@ -73,6 +75,7 @@ pub(super) fn exec_no_pty(
         command_pid,
         sudo_pid,
         errpipe_rx,
+        background,
         &mut registry,
         original_signals,
     )?;
@@ -115,10 +118,11 @@ impl ExecClosure {
         command_pid: ProcessId,
         sudo_pid: ProcessId,
         errpipe_rx: BinPipe<i32>,
+        background: Option<Background>,
         registry: &mut EventRegistry<Self>,
         mut original_signals: SignalsState,
     ) -> io::Result<Self> {
-        let errpipe = ErrPipe::new(errpipe_rx, registry, ExecEvent::ErrPipe);
+        let errpipe = ErrPipe::new(errpipe_rx, background, registry, ExecEvent::ErrPipe);
 
         let signal_stream = SignalStream::init()?;
 
