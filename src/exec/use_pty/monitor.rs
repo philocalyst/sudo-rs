@@ -8,6 +8,7 @@ use crate::system::signal::{
 use crate::{
     common::bin_serde::BinPipe,
     exec::{
+        ErrPipe,
         event::{EventRegistry, Process},
         exec_command,
         io_util::{retry_while_interrupted, was_interrupted},
@@ -114,6 +115,8 @@ pub(super) fn exec_monitor(
 
         exec_command(command, original_set, original_signals, errpipe_tx)
     };
+    // Only the command process may hold the sending end, see `ErrPipe`.
+    drop(errpipe_tx);
 
     // Send the command's PID to the parent.
     if let Err(err) = backchannel.send(&ParentMessage::CommandPid(command_pid)) {
@@ -217,7 +220,7 @@ struct MonitorClosure<'a> {
     command_pgrp: ProcessId,
     monitor_pgrp: ProcessId,
     pty_follower: PtyFollower,
-    errpipe_rx: BinPipe<i32>,
+    errpipe: ErrPipe,
     backchannel: &'a mut MonitorBackchannel,
     signal_stream: &'static SignalStream,
     _signal_handlers: [SignalHandler; MonitorClosure::SIGNALS.len()],
@@ -240,9 +243,7 @@ impl<'a> MonitorClosure<'a> {
         let monitor_pgrp = getpgrp();
 
         // Register the callback to receive the IO error if the command fails to execute.
-        registry.register_event(&errpipe_rx, PollEvent::Readable, |_| {
-            MonitorEvent::ReadableErrPipe
-        });
+        let errpipe = ErrPipe::new(errpipe_rx, registry, MonitorEvent::ReadableErrPipe);
 
         // Enable nonblocking assertions as we will poll this inside the event loop.
         backchannel.set_nonblocking_assertions(true);
@@ -269,7 +270,7 @@ impl<'a> MonitorClosure<'a> {
             command_pgrp,
             monitor_pgrp,
             pty_follower,
-            errpipe_rx,
+            errpipe,
             backchannel,
             signal_stream,
             _signal_handlers: signal_handlers,
@@ -303,13 +304,10 @@ impl<'a> MonitorClosure<'a> {
     }
 
     fn read_errpipe(&mut self, registry: &mut EventRegistry<Self>) {
-        match self.errpipe_rx.read() {
+        match self.errpipe.read(registry) {
             Err(err) if was_interrupted(&err) => { /* Retry later */ }
             Err(err) => registry.set_break(err),
-            Ok(error_code) => {
-                // Received error code from the command, forward it to the parent.
-                registry.set_break(io::Error::from_raw_os_error(error_code));
-            }
+            Ok(()) => {}
         }
     }
 
@@ -434,12 +432,14 @@ impl HandleSigchld for MonitorClosure<'_> {
     const OPTIONS: WaitOptions = WaitOptions::new().untraced().no_hang();
 
     fn on_exit(&mut self, exit_code: c_int, registry: &mut EventRegistry<Self>) {
-        registry.set_exit(CommandStatus::Exit(exit_code));
+        self.errpipe
+            .command_terminated(CommandStatus::Exit(exit_code), registry);
         self.command_pid = None;
     }
 
     fn on_term(&mut self, signal: c_int, registry: &mut EventRegistry<Self>) {
-        registry.set_exit(CommandStatus::Term(signal));
+        self.errpipe
+            .command_terminated(CommandStatus::Term(signal), registry);
         self.command_pid = None;
     }
 

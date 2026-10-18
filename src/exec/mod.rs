@@ -34,8 +34,8 @@ use crate::{
 };
 
 use self::{
-    event::{EventRegistry, Process},
-    io_util::was_interrupted,
+    event::{EventHandle, EventRegistry, PollEvent, Process},
+    io_util::{retry_while_interrupted, was_interrupted},
     use_pty::{SIGCONT_BG, SIGCONT_FG, exec_pty},
 };
 
@@ -268,6 +268,74 @@ fn exec_command(
     _exit(1);
 }
 
+/// The receiving end of the pipe that [`exec_command`] reports to.
+///
+/// The command process sends the error that kept it from executing the command. Otherwise, as its
+/// end of the pipe is close-on-exec and the supervisor keeps no copy of it, the pipe reaches its
+/// end once the command is executed (or once the command process is gone). Original sudo reads
+/// its error pipe the same way, see `errpipe_cb` in
+/// <https://github.com/sudo-project/sudo/blob/84e7ca6752a2d3a32452adee177d1f57421dd814/src/exec_nopty.c#L74-L116>.
+struct ErrPipe {
+    /// `None` once the command process has reported.
+    rx: Option<BinPipe<i32>>,
+    event: EventHandle,
+    error: Option<io::Error>,
+}
+
+impl ErrPipe {
+    /// Poll the pipe, producing `event` when the command process has reported.
+    fn new<T: Process>(rx: BinPipe<i32>, registry: &mut EventRegistry<T>, event: T::Event) -> Self {
+        let event = registry.register_event(&rx, PollEvent::Readable, move |_| event);
+
+        Self {
+            rx: Some(rx),
+            event,
+            error: None,
+        }
+    }
+
+    /// Read the report of the command process, waiting for it if it has not arrived yet.
+    fn read<T: Process>(&mut self, registry: &mut EventRegistry<T>) -> io::Result<()> {
+        let Some(rx) = &mut self.rx else {
+            return Ok(());
+        };
+
+        match rx.read() {
+            Ok(error_code) => self.error = Some(io::Error::from_raw_os_error(error_code)),
+            Err(err) if err.kind() == io::ErrorKind::UnexpectedEof => {}
+            Err(err) => return Err(err),
+        }
+
+        // A pipe at its end remains readable, so stop polling it.
+        self.event.ignore(registry);
+        self.rx = None;
+        Ok(())
+    }
+
+    /// Stop the event loop now that the command process has terminated with `status`.
+    ///
+    /// If the command process reported that it could not execute the command, its exit status
+    /// only follows from that, so the loop stops with the reported error instead. Reading the
+    /// report cannot block anymore: the command process held the only other end of the pipe. This
+    /// way it does not matter which of the two the event loop learns of first, as in
+    /// `handle_sigchld_nopty` of original sudo:
+    /// <https://github.com/sudo-project/sudo/blob/84e7ca6752a2d3a32452adee177d1f57421dd814/src/exec_nopty.c#L807-L811>.
+    fn command_terminated<T: Process<Break = io::Error>>(
+        &mut self,
+        status: T::Exit,
+        registry: &mut EventRegistry<T>,
+    ) {
+        if let Err(err) = retry_while_interrupted(|| self.read(registry)) {
+            return registry.set_break(err);
+        }
+
+        match self.error.take() {
+            Some(err) => registry.set_break(err),
+            None => registry.set_exit(status),
+        }
+    }
+}
+
 // Kill the process with increasing urgency.
 //
 // Based on `terminate_command`.
@@ -348,4 +416,68 @@ const fn cond_fmt<'a>(cond: bool, true_s: &'a str, false_s: &'a str) -> &'a str 
 
 const fn opt_fmt(cond: bool, s: &str) -> &str {
     cond_fmt(cond, s, "")
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io;
+
+    use super::{
+        ErrPipe,
+        event::{EventRegistry, Process, StopReason},
+    };
+    use crate::common::bin_serde::BinPipe;
+
+    /// A supervisor that only waits for the command process to terminate.
+    struct Supervisor;
+
+    impl Process for Supervisor {
+        type Event = ();
+        type Break = io::Error;
+        type Exit = i32;
+
+        fn on_event(&mut self, (): (), _registry: &mut EventRegistry<Self>) {
+            panic!("the error pipe is still being polled")
+        }
+    }
+
+    /// How the event loop stops once the command process exits with status 1 after sending
+    /// `report` over its error pipe, when the supervisor has read the pipe before or not.
+    fn stop_reason(report: Option<i32>, read_first: bool) -> StopReason<Supervisor> {
+        let (mut tx, rx) = BinPipe::pair().unwrap();
+        let mut registry = EventRegistry::new();
+        let mut errpipe = ErrPipe::new(rx, &mut registry, ());
+
+        if let Some(error_code) = report {
+            tx.write(&error_code).unwrap();
+        }
+        drop(tx);
+
+        if read_first {
+            errpipe.read(&mut registry).unwrap();
+        }
+        errpipe.command_terminated(1, &mut registry);
+
+        registry.event_loop(&mut Supervisor)
+    }
+
+    #[test]
+    fn exec_error_outranks_exit_status() {
+        for read_first in [true, false] {
+            let StopReason::Break(err) = stop_reason(Some(libc::ENOENT), read_first) else {
+                panic!("the exec error was lost (read first: {read_first})");
+            };
+            assert_eq!(err.raw_os_error(), Some(libc::ENOENT));
+        }
+    }
+
+    #[test]
+    fn executed_command_exits_with_its_status() {
+        for read_first in [true, false] {
+            let StopReason::Exit(status) = stop_reason(None, read_first) else {
+                panic!("no exit status (read first: {read_first})");
+            };
+            assert_eq!(status, 1);
+        }
+    }
 }
