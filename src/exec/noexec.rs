@@ -194,7 +194,10 @@ union SingleRightAnciliaryData {
 }
 
 /// Receives a raw file descriptor from the provided UnixStream
-fn receive_fd(rx_fd: UnixStream) -> OwnedFd {
+///
+/// Returns `None` if the stream is closed without a file descriptor being sent, which happens
+/// when the command process could not install the filter: it reports why itself.
+fn receive_fd(rx_fd: UnixStream) -> Option<OwnedFd> {
     let mut data = [0u8; 1];
     let mut iov = iovec {
         iov_base: &mut data as *mut [u8; 1] as *mut c_void,
@@ -215,8 +218,10 @@ fn receive_fd(rx_fd: UnixStream) -> OwnedFd {
     msg.msg_control = &mut control as *mut _ as *mut c_void;
 
     // SAFETY: A valid socket fd and a valid initialized msghdr are passed in.
-    if unsafe { recvmsg(rx_fd.as_raw_fd(), &mut msg, 0) } == -1 {
-        panic!("failed to recvmsg: {}", io::Error::last_os_error());
+    match unsafe { recvmsg(rx_fd.as_raw_fd(), &mut msg, 0) } {
+        -1 => panic!("failed to recvmsg: {}", io::Error::last_os_error()),
+        0 => return None,
+        _ => {}
     }
 
     if msg.msg_flags & MSG_TRUNC == MSG_TRUNC {
@@ -233,7 +238,8 @@ fn receive_fd(rx_fd: UnixStream) -> OwnedFd {
         {
             unreachable!("unexpected response from Linux kernel");
         }
-        OwnedFd::from_raw_fd(CMSG_DATA(cmsgp).cast::<c_int>().read())
+        let notify_fd = CMSG_DATA(cmsgp).cast::<c_int>().read();
+        Some(OwnedFd::from_raw_fd(notify_fd))
     }
 }
 
@@ -279,9 +285,10 @@ pub(crate) struct SpawnNoexecHandler(UnixStream);
 impl SpawnNoexecHandler {
     pub(super) fn spawn(self) {
         thread::spawn(move || {
-            let notify_fd = receive_fd(self.0);
-            // SAFETY: notify_fd is a valid seccomp_unotify fd.
-            unsafe { handle_notifications(notify_fd) };
+            if let Some(notify_fd) = receive_fd(self.0) {
+                // SAFETY: notify_fd is a valid seccomp_unotify fd.
+                unsafe { handle_notifications(notify_fd) };
+            }
         });
     }
 }

@@ -12,6 +12,7 @@ use crate::exec::use_pty::SIGCONT_FG;
 use crate::exec::use_pty::monitor::exec_monitor;
 use crate::exec::{
     ExitReason, SpawnNoexecHandler,
+    background::Background,
     io_util::retry_while_interrupted,
     use_pty::backchannel::{BackchannelPair, MonitorMessage, ParentBackchannel, ParentMessage},
 };
@@ -35,7 +36,7 @@ pub(in crate::exec) fn exec_pty(
     mut command: Command,
     user_tty: UserTerm,
     pty_owner: &User,
-    background: bool,
+    background: Option<Background>,
 ) -> io::Result<ExitReason> {
     // Allocate a pseudoterminal.
     let pty = get_pty(pty_owner)?;
@@ -96,7 +97,7 @@ pub(in crate::exec) fn exec_pty(
         ParentEvent::Pty,
     );
 
-    if background {
+    if background.is_some() {
         tty_pipe.disable_input(&mut registry);
     }
 
@@ -125,7 +126,7 @@ pub(in crate::exec) fn exec_pty(
     // FIXME: ogsudo creates pipes for the IO streams and uses events to read from the strams to
     // the pipes. Investigate why.
     if !io::stdin().is_terminal_for_pgrp(parent_pgrp) {
-        if background {
+        if background.is_some() {
             // Running in background (sudo -b), no access to terminal input.
             // In non-pty mode, the command runs in an orphaned process
             // group and reads from the controlling terminal fail with EIO.
@@ -228,6 +229,7 @@ pub(in crate::exec) fn exec_pty(
             pty.follower,
             command,
             foreground && !exec_bg,
+            background,
             &mut backchannels.monitor,
             original_set,
             original_signals,
