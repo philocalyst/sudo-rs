@@ -226,6 +226,14 @@ jobs:
         if: matrix.os == 'macos-latest'
         run: cargo clippy --workspace --all-targets -- --deny warnings
 
+      - name: Check optional macOS features
+        if: matrix.os == 'macos-latest'
+        run: cargo check --all-targets --features pam-login,unstable-remote-sudoers
+
+      - name: Native macOS privilege integration
+        if: matrix.os == 'macos-latest'
+        run: /usr/bin/script -q -e /dev/null ./util/test-macos-native.sh --non-interactive --bin-dir target/release
+
   build-and-test-minimal:
     runs-on: ubuntu-latest
 
