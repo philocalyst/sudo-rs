@@ -1,5 +1,5 @@
 use std::{
-    env::{self, consts::OS},
+    env,
     fs::{self, File},
     io::{ErrorKind, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
@@ -14,6 +14,13 @@ pub use self::command::{As, Child, Command, Output};
 mod command;
 
 const DOCKER_RUN_COMMAND: &[&str] = &["sleep", "1000d"];
+
+// Docker runs Linux guests on macOS; only FreeBSD uses native jails.
+const CONTAINER_OS: &str = if cfg!(target_os = "freebsd") {
+    "freebsd"
+} else {
+    "linux"
+};
 
 pub struct Container {
     id: String,
@@ -270,7 +277,7 @@ pub fn build_base_image() {
             cmd.current_dir(repo_root);
             cmd.args([
                 "-f",
-                &format!("test-framework/sudo-test/src/ours.{OS}.Dockerfile"),
+                &format!("test-framework/sudo-test/src/ours.{CONTAINER_OS}.Dockerfile"),
                 ".",
             ]);
         }
@@ -280,7 +287,7 @@ pub fn build_base_image() {
             let f = File::open(
                 repo_root
                     .join("test-framework/sudo-test/src")
-                    .join(format!("theirs.{OS}.Dockerfile")),
+                    .join(format!("theirs.{CONTAINER_OS}.Dockerfile")),
             )
             .unwrap();
             cmd.arg("-").stdin(Stdio::from(f));
@@ -331,11 +338,25 @@ mod tests {
 
     use super::*;
 
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     const IMAGE: &str = "ubuntu:22.04";
 
     #[cfg(target_os = "freebsd")]
     const IMAGE: &str = "dougrabson/freebsd14-small:latest";
+
+    #[test]
+    fn guest_dockerfiles_exist_for_the_host_backend() {
+        for implementation in ["ours", "theirs"] {
+            let path = repo_root().join(format!(
+                "test-framework/sudo-test/src/{implementation}.{CONTAINER_OS}.Dockerfile"
+            ));
+            assert!(
+                path.is_file(),
+                "missing guest Dockerfile: {}",
+                path.display()
+            );
+        }
+    }
 
     #[test]
     fn eventually_removes_container_on_drop() {
@@ -380,7 +401,7 @@ mod tests {
 
         let docker = Container::new(IMAGE);
 
-        if cfg!(target_os = "linux") {
+        if cfg!(any(target_os = "linux", target_os = "macos")) {
             docker
                 .output(Command::new("useradd").arg(username))
                 .assert_success();

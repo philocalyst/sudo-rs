@@ -5,7 +5,7 @@ use crate::{SUDOERS_NO_LECTURE, USERNAME};
 macro_rules! assert_snapshot {
     ($($tt:tt)*) => {
         insta::with_settings!({
-            filters => if cfg!(target_os = "linux") {
+            filters => if cfg!(any(target_os = "linux", target_os = "macos")) {
                 vec![(r"[[:xdigit:]]{12}", "[host]")]
             } else {
                 vec![

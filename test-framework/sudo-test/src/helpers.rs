@@ -1,7 +1,7 @@
 //! Test helpers
 
 /// A command which will print the owner of it's TTY in the format "username group"
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 pub const PRINT_PTY_OWNER: &str = "stat $(tty) --format '%U %G'";
 
 /// A command which will print the owner of it's TTY in the format "username group"
@@ -57,7 +57,7 @@ pub struct PsAuxEntry {
 impl PsAuxEntry {
     /// whether the process has an associated PTY
     pub fn has_tty(&self) -> bool {
-        if cfg!(target_os = "linux") {
+        if cfg!(any(target_os = "linux", target_os = "macos")) {
             // On Linux the PTY is either ? when there is no pty, starts with pts/ for a pseudo
             // terminal or starts with tty in case of a virtual terminal. The last case shouldn't
             // happen inside of containers.

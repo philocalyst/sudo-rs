@@ -121,7 +121,7 @@ pub fn Env(sudoers: impl Into<TextFile>) -> EnvBuilder {
         .insert_str(0, "Defaults !fqdn, !lecture, !mailerpath\n");
     builder.file(ETC_SUDOERS, sudoers);
 
-    if cfg!(target_os = "linux") {
+    if cfg!(any(target_os = "linux", target_os = "macos")) {
         // Ubuntu uses pam_env to set a bunch of extra env vars that various tests don't expect to be set.
         builder.default_file(PAM_D_SUDO_PATH, STOCK_PAM_D_SUDO);
         builder.default_file(PAM_D_SU_PATH, STOCK_PAM_D_SU);
@@ -414,7 +414,7 @@ impl EnvBuilder {
                             .stdin(password),
                     )
                     .assert_success();
-            } else if cfg!(target_os = "linux") {
+            } else if cfg!(any(target_os = "linux", target_os = "macos")) {
                 container
                     .output(Command::new("chpasswd").stdin(format!("{username}:{password}")))
                     .assert_success();
@@ -576,7 +576,7 @@ impl User {
                     )
                     .assert_success();
             }
-        } else if cfg!(target_os = "linux") {
+        } else if cfg!(any(target_os = "linux", target_os = "macos")) {
             let mut useradd = Command::new("useradd");
             useradd.arg("--no-user-group");
             if self.create_home_directory {
@@ -665,7 +665,7 @@ impl Group {
                 groupadd.arg(id.to_string());
             }
             container.output(&groupadd).assert_success();
-        } else if cfg!(target_os = "linux") {
+        } else if cfg!(any(target_os = "linux", target_os = "macos")) {
             let mut groupadd = Command::new("groupadd");
             if let Some(id) = self.id {
                 groupadd.arg("--gid");
