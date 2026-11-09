@@ -145,7 +145,6 @@ pub(crate) unsafe fn fork() -> io::Result<ForkResult> {
 unsafe fn fork_for_test(child_func: impl FnOnce() -> std::convert::Infallible) -> ProcessId {
     use std::io::Write;
     use std::panic::{AssertUnwindSafe, catch_unwind};
-    use std::process::exit;
 
     // SAFETY: Not really safe, but this is test only code.
     match unsafe { fork() }.unwrap() {
@@ -165,7 +164,8 @@ unsafe fn fork_for_test(child_func: impl FnOnce() -> std::convert::Infallible) -
             };
             let _ = writeln!(std::io::stderr(), "{s}");
 
-            exit(101);
+            // Runtime cleanup can acquire locks held by threads lost at fork.
+            _exit(101);
         }
         ForkResult::Parent(pid) => pid,
     }
@@ -931,7 +931,6 @@ mod tests {
             fd::{AsFd, AsRawFd},
             unix::net::UnixStream,
         },
-        process::exit,
     };
 
     use libc::SIGKILL;
@@ -939,7 +938,7 @@ mod tests {
     use crate::system::interface::{GroupId, ProcessId, UserId};
 
     use super::{
-        Group, ROOT_GROUP_NAME, User, WithProcess, fork_for_test, getpgrp, setpgid,
+        _exit as exit, Group, ROOT_GROUP_NAME, User, WithProcess, fork_for_test, getpgrp, setpgid,
         wait::{Wait, WaitOptions},
     };
 
