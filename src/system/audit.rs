@@ -120,7 +120,15 @@ fn get_peer_credentials(stream: &UnixStream) -> io::Result<libc::ucred> {
         ))?;
     }
 
-    Ok(ucred)
+    Ok((UserId::new(ucred.uid), GroupId::new(ucred.gid)))
+}
+
+#[cfg(all(feature = "unstable-remote-sudoers", not(target_os = "linux")))]
+fn get_peer_credentials(stream: &UnixStream) -> io::Result<(UserId, GroupId)> {
+    let (mut uid, mut gid) = (0, 0);
+    // SAFETY: getpeereid receives two valid output pointers and a live socket.
+    cerr(unsafe { libc::getpeereid(stream.as_raw_fd(), &mut uid, &mut gid) })?;
+    Ok((UserId::new(uid), GroupId::new(gid)))
 }
 
 /// Drop root privileges by setting effective user id equal to the real user id.
@@ -312,9 +320,9 @@ fn secure_open_socket_impl(
 
     // If there is an error in these checks, the function returns immediately
     // leaving `stream` out of scope and forcing the closing of the socket.
-    check_peer(UserId::new(peer_creds.uid), user, "user")?;
+    check_peer(peer_creds.0, user, "user")?;
     if let Some(group) = group {
-        check_peer(GroupId::new(peer_creds.gid), group, "group")?;
+        check_peer(peer_creds.1, group, "group")?;
     }
 
     stream.shutdown(Shutdown::Write)?;
@@ -477,6 +485,16 @@ fn traversed_secure_open(
 #[cfg(test)]
 mod test {
     use super::*;
+
+    #[cfg(feature = "unstable-remote-sudoers")]
+    #[test]
+    fn remote_socket_peer_credentials_match_the_process() {
+        let (socket, _peer) = UnixStream::pair().unwrap();
+        let (uid, gid) = get_peer_credentials(&socket).unwrap();
+        // SAFETY: these functions are always safe to call.
+        let expected = unsafe { (libc::geteuid(), libc::getegid()) };
+        assert_eq!((uid.inner(), gid.inner()), expected);
+    }
 
     #[test]
     fn secure_open_is_predictable() {

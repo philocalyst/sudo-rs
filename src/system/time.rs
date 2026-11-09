@@ -5,7 +5,7 @@ use std::{
     time::Duration,
 };
 
-/// A timestamp relative to `CLOCK_BOOTTIME`.
+/// A monotonic timestamp that continues advancing during system sleep.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub struct SystemTime {
     secs: i64,
