@@ -26,6 +26,8 @@ use time::ProcessCreateTime;
 use self::signal::SignalNumber;
 
 pub(crate) mod audit;
+#[cfg(target_os = "macos")]
+mod macos;
 // generalized traits for when we want to hide implementations
 pub mod interface;
 
@@ -51,7 +53,12 @@ pub(crate) fn _exit(status: c_int) -> ! {
 
 fn set_cloexec(fd: c_int) -> io::Result<()> {
     // SAFETY: This only sets the CLOEXEC flag; it does not close or invalidate the fd.
-    unsafe { cerr(libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC)) }.map(|_| ())
+    match unsafe { cerr(libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC)) } {
+        Ok(_) => Ok(()),
+        // An enumerated descriptor may have disappeared since the snapshot.
+        Err(err) if err.raw_os_error() == Some(libc::EBADF) => Ok(()),
+        Err(err) => Err(err),
+    }
 }
 
 /// Attempts close_range(CLOSE_RANGE_CLOEXEC) for all fds >= lowfd.
@@ -85,54 +92,6 @@ fn try_close_range(lowfd: c_int) -> io::Result<bool> {
         Err(e) if e.raw_os_error() == Some(ENOSYS) || e.raw_os_error() == Some(EINVAL) => Ok(false),
         Err(e) => Err(e),
     }
-}
-
-/// Attempts to set CLOEXEC on all fds >= lowfd via proc_pidinfo(PROC_PIDLISTFDS).
-/// Returns Ok(true) on success, Ok(false) if proc_pidinfo is unavailable, Err on failure.
-#[cfg(target_os = "macos")]
-fn try_proc_pidinfo(lowfd: c_int) -> io::Result<bool> {
-    const WIGGLE_ROOM: i32 = 4;
-
-    // SAFETY: getpid() is always safe to call.
-    let pid = unsafe { libc::getpid() };
-
-    // SAFETY: passing a null buffer with size 0 just queries the required buffer size.
-    let needed =
-        unsafe { libc::proc_pidinfo(pid, libc::PROC_PIDLISTFDS, 0, std::ptr::null_mut(), 0) };
-
-    // If needed is zero, there are no open files.
-    // If needed is less than zero, alternate methods should be considered
-    // Either way, we want to recover, so throw unavailable.
-    if needed <= 0 {
-        return Ok(false);
-    }
-
-    // Allocate with wiggle room for any extraneous fds opened between the two calls.
-    let cap = needed + (libc::PROC_PIDLISTFD_SIZE * WIGGLE_ROOM);
-    let count = cap as usize / std::mem::size_of::<libc::proc_fdinfo>();
-    let mut buf: Vec<libc::proc_fdinfo> = Vec::with_capacity(count);
-
-    // SAFETY: since proc_fdinfo is a plain C struct... we assume that proc_pidinfo fills the allocation safely.
-    let filled =
-        unsafe { libc::proc_pidinfo(pid, libc::PROC_PIDLISTFDS, 0, buf.as_mut_ptr().cast(), cap) };
-
-    if filled <= 0 {
-        return Ok(false);
-    }
-
-    let pidlistfd_size = std::mem::size_of::<libc::proc_fdinfo>();
-    let n = filled as usize / pidlistfd_size;
-
-    // SAFETY: proc_pidinfo wrote `n` valid entries into the buffer.
-    unsafe { buf.set_len(n) };
-
-    for info in &buf {
-        if info.proc_fd >= lowfd {
-            set_cloexec(info.proc_fd)?;
-        }
-    }
-
-    Ok(true)
 }
 
 /// The directory that lists our open fds: procfs on Linux, fdescfs everywhere else.
@@ -178,8 +137,9 @@ pub(crate) fn mark_fds_as_cloexec() -> io::Result<()> {
     if try_close_range(lowfd)? {
         return Ok(());
     }
+    // macOS has no close_range, but the kernel can list our fds directly.
     #[cfg(target_os = "macos")]
-    if try_proc_pidinfo(lowfd)? {
+    if macos::mark_fds_as_cloexec(lowfd)? {
         return Ok(());
     }
 
@@ -1048,6 +1008,45 @@ mod tests {
             .write(true)
             .create_new(true)
             .open(path)
+    }
+
+    fn check_descriptor_inheritance(mark: impl Fn()) {
+        let child = unsafe {
+            fork_for_test(|| {
+                let file = std::fs::File::open("/dev/null").unwrap();
+                // F_DUPFD deliberately creates a sparse, inheritable descriptor.
+                let fd =
+                    crate::cutils::cerr(libc::fcntl(file.as_raw_fd(), libc::F_DUPFD, 128)).unwrap();
+                let open_in_child = |expected: bool| {
+                    let op = if expected { "-e" } else { "! -e" };
+                    std::process::Command::new("/bin/sh")
+                        .args(["-c", &format!("test {op} /dev/fd/{fd}")])
+                        .status()
+                        .unwrap()
+                        .success()
+                };
+                assert!(
+                    open_in_child(true),
+                    "control: descriptor must survive exec before marking"
+                );
+                mark();
+                assert!(open_in_child(false), "descriptor leaked through exec");
+                assert_eq!(libc::close(fd), 0);
+                exit(0);
+            })
+        };
+        let (_, status) = child.wait(WaitOptions::new()).unwrap();
+        assert_eq!(status.exit_status(), Some(0));
+    }
+
+    #[test]
+    fn cloexec_prevents_descriptor_inheritance() {
+        check_descriptor_inheritance(|| super::mark_fds_as_cloexec().unwrap());
+    }
+
+    #[test]
+    fn fd_directory_fallback_prevents_descriptor_inheritance() {
+        check_descriptor_inheritance(|| super::cloexec_via_fd_dir(3).unwrap());
     }
 
     #[test]
