@@ -701,7 +701,6 @@ impl Group {
 
 pub enum WithProcess {
     Current,
-    #[allow(dead_code)]
     Other(ProcessId),
 }
 
@@ -839,8 +838,9 @@ impl Process {
     /// Returns the device identifier of the TTY device that is currently
     /// attached to the given process
     #[cfg(target_os = "macos")]
-    pub fn tty_device_id(_pid: WithProcess) -> std::io::Result<Option<DeviceId>> {
-        Ok(None)
+    pub fn tty_device_id(pid: WithProcess) -> std::io::Result<Option<DeviceId>> {
+        let info = macos::process_info(pid)?;
+        Ok((info.e_tdev != u32::MAX).then(|| DeviceId::new(info.e_tdev as libc::dev_t)))
     }
 
     /// Get the process starting time of a specific process
@@ -876,8 +876,17 @@ impl Process {
 
     /// Get the process starting time of a specific process
     #[cfg(target_os = "macos")]
-    pub fn starting_time(_pid: WithProcess) -> io::Result<ProcessCreateTime> {
-        Ok(ProcessCreateTime::new(0, 0))
+    pub fn starting_time(pid: WithProcess) -> io::Result<ProcessCreateTime> {
+        let info = macos::process_info(pid)?;
+        let secs = i64::try_from(info.pbi_start_tvsec)
+            .map_err(|_| io::Error::other("invalid process start time"))?;
+        if info.pbi_start_tvusec >= 1_000_000 {
+            return Err(io::Error::other("invalid process start time"));
+        }
+        Ok(ProcessCreateTime::new(
+            secs,
+            info.pbi_start_tvusec as i64 * 1000,
+        ))
     }
 }
 

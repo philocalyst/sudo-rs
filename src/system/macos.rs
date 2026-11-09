@@ -1,8 +1,41 @@
 //! Darwin process queries. Keep the platform ABI details out of the execution pipeline.
 
-use std::io;
+use std::{io, mem::MaybeUninit};
 
-use super::{Process, set_cloexec};
+use super::{Process, WithProcess, set_cloexec};
+
+pub(super) fn process_info(process: WithProcess) -> io::Result<libc::proc_bsdinfo> {
+    let pid = match process {
+        WithProcess::Current => Process::process_id().inner(),
+        WithProcess::Other(pid) => pid.inner(),
+    };
+    if pid <= 0 {
+        return Err(io::ErrorKind::InvalidInput.into());
+    }
+    let mut info = MaybeUninit::<libc::proc_bsdinfo>::uninit();
+    let size = size_of::<libc::proc_bsdinfo>() as i32;
+    // SAFETY: PROC_PIDTBSDINFO writes at most size bytes to a correctly aligned buffer.
+    let filled = unsafe {
+        libc::proc_pidinfo(
+            pid,
+            libc::PROC_PIDTBSDINFO,
+            0,
+            info.as_mut_ptr().cast(),
+            size,
+        )
+    };
+    if filled <= 0 {
+        return Err(io::Error::last_os_error());
+    }
+    if filled != size {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "incomplete process information",
+        ));
+    }
+    // SAFETY: the successful query initialized the entire proc_bsdinfo.
+    Ok(unsafe { info.assume_init() })
+}
 
 fn list_fds(
     mut query: impl FnMut(&mut [libc::proc_fdinfo]) -> io::Result<usize>,
@@ -82,6 +115,52 @@ mod tests {
     use super::*;
 
     #[test]
+    fn process_identity_and_controlling_terminal_are_real() {
+        use super::super::{
+            _exit as exit, DeviceId,
+            WithProcess::*,
+            fork_for_test,
+            interface::ProcessId,
+            setsid,
+            term::{Pty, Terminal},
+            wait::{Wait, WaitOptions},
+        };
+        use std::os::fd::{AsFd, AsRawFd};
+        // SAFETY: test-only fork helper contains any panic in the child.
+        let child = unsafe {
+            fork_for_test(|| {
+                let original = Process::starting_time(Current).unwrap();
+                assert_eq!(
+                    original,
+                    Process::starting_time(Other(Process::process_id())).unwrap()
+                );
+                let info = process_info(Current).unwrap();
+                assert!(info.pbi_start_tvsec > 0);
+                setsid().unwrap();
+                assert_eq!(Process::tty_device_id(Current).unwrap(), None);
+                let pty = Pty::open().unwrap();
+                pty.follower.make_controlling_terminal().unwrap();
+                let fd = pty.follower.as_fd();
+                let mut stat = MaybeUninit::<libc::stat>::uninit();
+                // SAFETY: valid descriptor and correctly sized stat buffer.
+                crate::cutils::cerr(libc::fstat(fd.as_raw_fd(), stat.as_mut_ptr())).unwrap();
+                // SAFETY: fstat succeeded and initialized the stat struct.
+                let expected = DeviceId::new(stat.assume_init().st_rdev);
+                assert_eq!(Process::tty_device_id(Current).unwrap(), Some(expected));
+                assert_eq!(
+                    Process::tty_device_id(Other(ProcessId::new(std::process::id() as i32)))
+                        .unwrap(),
+                    Some(expected)
+                );
+                assert_eq!(Process::starting_time(Current).unwrap(), original);
+                exit(0);
+            })
+        };
+        let (_, status) = child.wait(WaitOptions::new()).unwrap();
+        assert_eq!(status.exit_status(), Some(0));
+    }
+
+    #[test]
     fn descriptor_list_retries_truncated_and_growing_snapshots() {
         let mut calls = 0;
         let fds = list_fds(|buffer| {
@@ -106,4 +185,11 @@ mod tests {
         assert!(list_fds(|buffer| Ok(size_of_val(buffer) + 8)).is_err());
         assert!(list_fds(|_| Err(io::Error::from_raw_os_error(libc::EPERM))).is_err());
     }
-}
+
+    #[test]
+    fn process_queries_reject_invalid_pids() {
+        use super::super::interface::ProcessId;
+        for pid in [0, -1, i32::MAX] {
+            assert!(process_info(WithProcess::Other(ProcessId::new(pid))).is_err());
+        }
+    }

@@ -106,7 +106,7 @@ impl From<libc::timespec> for SystemTime {
     }
 }
 
-/// A timestamp relative to `CLOCK_BOOTTIME` on Linux and relative to `CLOCK_REALTIME` on FreeBSD.
+/// A process identity timestamp: boot-relative on Linux, wall-clock on BSD/macOS.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub struct ProcessCreateTime {
     secs: i64,
@@ -181,9 +181,19 @@ mod tests {
         use crate::system::{Process, WithProcess};
         let time = Process::starting_time(WithProcess::Current).unwrap();
 
+        #[cfg(target_os = "linux")]
         let now = {
             let super::SystemTime { secs, nsecs } = super::SystemTime::now().unwrap();
             super::ProcessCreateTime { secs, nsecs }
+        };
+        // BSD process creation times are wall-clock timestamps, used only as
+        // process identity tokens, rather than the monotonic timeout clock.
+        #[cfg(not(target_os = "linux"))]
+        let now = {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap();
+            super::ProcessCreateTime::new(now.as_secs() as i64, now.subsec_nanos().into())
         };
 
         assert!(time.secs > now.secs - 24 * 60 * 60);
