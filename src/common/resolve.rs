@@ -1,3 +1,5 @@
+#[cfg(target_os = "macos")]
+use crate::system::interface::UnixUser;
 use crate::system::interface::UserId;
 use crate::system::{Group, User};
 use core::fmt;
@@ -65,7 +67,17 @@ impl CurrentUser {
     pub fn resolve() -> Result<Self, Error> {
         let mut cur_user = User::real()?.ok_or(Error::UserNotFound("current user".to_string()))?;
         // the current user can also have groups that are defined at runtime, so fetch the dynamic groups
-        cur_user.groups = User::real_groups()?;
+        let runtime_groups = User::real_groups()?;
+        #[cfg(target_os = "macos")]
+        let use_runtime_groups = !runtime_groups
+            .iter()
+            .all(|gid| cur_user.in_group_by_gid(*gid));
+        #[cfg(not(target_os = "macos"))]
+        let use_runtime_groups = true;
+        if use_runtime_groups {
+            cur_user.groups = runtime_groups;
+            cur_user.use_explicit_groups();
+        }
         Ok(Self { inner: cur_user })
     }
 }

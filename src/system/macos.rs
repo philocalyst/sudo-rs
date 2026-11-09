@@ -2,7 +2,42 @@
 
 use std::{io, mem::MaybeUninit};
 
-use super::{Process, WithProcess, set_cloexec};
+use super::{GroupId, Process, UserId, WithProcess, set_cloexec};
+
+/// membership.h includes nested Open Directory memberships that need not appear
+/// in getgroups/getgrouplist's advisory group list. These APIs return errno
+/// values directly, rather than setting errno and returning -1.
+pub(super) fn is_group_member(uid: UserId, gid: GroupId) -> io::Result<bool> {
+    unsafe extern "C" {
+        fn mbr_uid_to_uuid(uid: libc::uid_t, uuid: *mut u8) -> libc::c_int;
+        fn mbr_gid_to_uuid(gid: libc::gid_t, uuid: *mut u8) -> libc::c_int;
+        fn mbr_check_membership(
+            user: *const u8,
+            group: *const u8,
+            member: *mut libc::c_int,
+        ) -> libc::c_int;
+    }
+    let (mut user, mut group) = ([0u8; 16], [0u8; 16]);
+    // SAFETY: both UUID buffers have the sixteen bytes required by uuid_t.
+    let result = unsafe { mbr_uid_to_uuid(uid.inner(), user.as_mut_ptr()) };
+    if result != 0 {
+        return Err(io::Error::from_raw_os_error(result));
+    }
+    // SAFETY: group points to sixteen initialized writable bytes.
+    let result = unsafe { mbr_gid_to_uuid(gid.inner(), group.as_mut_ptr()) };
+    if result != 0 {
+        return Err(io::Error::from_raw_os_error(result));
+    }
+    let mut member = 0;
+    // SAFETY: both UUIDs are initialized, and member is a valid output pointer.
+    let result = unsafe { mbr_check_membership(user.as_ptr(), group.as_ptr(), &mut member) };
+    match result {
+        0 => Ok(member != 0),
+        // Synthesized UUIDs can denote accounts/groups that no longer exist.
+        libc::ENOENT => Ok(false),
+        _ => Err(io::Error::from_raw_os_error(result)),
+    }
+}
 
 pub(super) fn process_info(process: WithProcess) -> io::Result<libc::proc_bsdinfo> {
     let pid = match process {
@@ -113,6 +148,12 @@ pub(super) fn mark_fds_as_cloexec(lowfd: i32) -> io::Result<bool> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn directory_membership_recognizes_the_primary_group() {
+        let user = super::super::User::real().unwrap().unwrap();
+        assert!(is_group_member(user.uid, user.gid).unwrap());
+    }
 
     #[test]
     fn process_identity_and_controlling_terminal_are_real() {

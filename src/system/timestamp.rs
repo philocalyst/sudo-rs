@@ -604,6 +604,8 @@ mod tests {
 
     fn auth_user_from_uid(uid: libc::uid_t) -> AuthUser {
         AuthUser::from_user_for_targetpw(User {
+            #[cfg(target_os = "macos")]
+            default_groups: false,
             uid: UserId::new(uid),
             gid: GroupId::new(0),
             name: SudoString::new("dummy".to_owned()).unwrap(),

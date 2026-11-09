@@ -1,4 +1,5 @@
 #![cfg_attr(not(feature = "unstable-remote-sudoers"), allow(unused_imports))]
+#[cfg(test)]
 use std::collections::HashSet;
 use std::ffi::{CStr, CString, c_int, c_uint};
 use std::fs::{self, DirBuilder, File, Metadata, OpenOptions};
@@ -14,7 +15,8 @@ use std::os::unix::{
 use std::path::{Component, Path};
 
 use super::{
-    Group, GroupId, User, UserId, cerr, inject_group, interface::UnixUser, set_supplementary_groups,
+    Group, GroupId, User, UserId, cerr, inject_group, interface::UnixUser,
+    set_supplementary_groups, set_user_groups,
 };
 use crate::common::resolve::CurrentUser;
 
@@ -57,17 +59,33 @@ pub(crate) fn sudo_call<T>(
     let mut target_groups = target_user.groups.clone();
     inject_group(target_group.gid, &mut target_groups);
 
-    if cfg!(test)
-        && target_user.uid == cur_user_id
-        && target_group.gid == cur_group_id
-        && target_groups.iter().collect::<HashSet<_>>() == cur_groups.iter().collect::<HashSet<_>>()
+    // Restoring a named account re-enables Open Directory membership lookup,
+    // which an explicit setgroups call would turn off.
+    #[cfg(target_os = "macos")]
+    let restore_account = User::real()
+        .map_err(|err| io::Error::other(err.to_string()))?
+        .filter(|user| cur_groups.iter().all(|gid| user.in_group_by_gid(*gid)));
+
+    #[cfg(test)]
     {
-        // we are not actually switching users, simply run the closure
-        // (this would also be safe in production mode, but it is a needless check)
-        return Ok(operation());
+        let same_groups = target_groups.iter().collect::<HashSet<_>>()
+            == cur_groups.iter().collect::<HashSet<_>>();
+        #[cfg(target_os = "macos")]
+        let same_groups = same_groups
+            || (target_user.default_groups
+                && cur_groups.iter().all(|gid| target_groups.contains(gid)));
+        if target_user.uid == cur_user_id && target_group.gid == cur_group_id && same_groups {
+            // Tests can open files as themselves without privileged setgroups.
+            return Ok(operation());
+        }
     }
 
-    struct ResetUserGuard(UserId, GroupId, Vec<GroupId>);
+    struct ResetUserGuard(
+        UserId,
+        GroupId,
+        Vec<GroupId>,
+        #[cfg(target_os = "macos")] Option<User>,
+    );
 
     impl Drop for ResetUserGuard {
         fn drop(&mut self) {
@@ -77,15 +95,27 @@ pub(crate) fn sudo_call<T>(
                 cerr(unsafe { libc::seteuid(UserId::inner(&self.0)) })?;
                 // SAFETY: this function is always safe to call
                 cerr(unsafe { libc::setegid(GroupId::inner(&self.1)) })?;
+                #[cfg(target_os = "macos")]
+                if let Some(user) = &self.3 {
+                    let mut groups = self.2.clone();
+                    inject_group(self.1, &mut groups);
+                    return set_user_groups(user, &groups);
+                }
                 set_supplementary_groups(&self.2)
             })()
             .expect("could not restore to saved user id");
         }
     }
 
-    let guard = ResetUserGuard(cur_user_id, cur_group_id, cur_groups);
+    let guard = ResetUserGuard(
+        cur_user_id,
+        cur_group_id,
+        cur_groups,
+        #[cfg(target_os = "macos")]
+        restore_account,
+    );
 
-    set_supplementary_groups(&target_groups)?;
+    set_user_groups(target_user, &target_groups)?;
     // SAFETY: this function is always safe to call
     cerr(unsafe { libc::setegid(GroupId::inner(&target_group.gid)) })?;
     // SAFETY: this function is always safe to call
@@ -535,6 +565,8 @@ mod test {
 
         let user = CurrentUser::resolve().unwrap();
         let other_user = CurrentUser::fake(User {
+            #[cfg(target_os = "macos")]
+            default_groups: false,
             uid: UserId::new(1042),
             gid: GroupId::new(1042),
 

@@ -94,6 +94,7 @@ impl SuContext {
 
         if !options.supp_group.is_empty() || !options.group.is_empty() {
             user.groups.clear();
+            user.use_explicit_groups();
         }
 
         for group_name in options.group.iter() {
