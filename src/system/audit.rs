@@ -1,7 +1,7 @@
 #![cfg_attr(not(feature = "unstable-remote-sudoers"), allow(unused_imports))]
 #[cfg(test)]
 use std::collections::HashSet;
-use std::ffi::{CStr, CString, c_int, c_uint};
+use std::ffi::{CStr, CString, c_uint};
 use std::fs::{self, DirBuilder, File, Metadata, OpenOptions};
 use std::io::{self, BufReader, Error, ErrorKind};
 use std::net::Shutdown;
@@ -376,8 +376,15 @@ fn open_at(parent: BorrowedFd, file_name: &CStr, create: bool) -> io::Result<Own
     }
 }
 
-#[allow(dead_code)]
-fn faccess_at(parent: BorrowedFd, path: &CStr, mode: c_int, flags: c_int) -> io::Result<()> {
+// AT_EMPTY_PATH (checking the file behind an fd) is not available on macOS or
+// NetBSD, so only the OSes that have it use faccessat for the write check.
+#[cfg(all(not(test), any(target_os = "linux", target_os = "freebsd")))]
+fn faccess_at(
+    parent: BorrowedFd,
+    path: &CStr,
+    mode: std::ffi::c_int,
+    flags: std::ffi::c_int,
+) -> io::Result<()> {
     // SAFETY: by design, a correct CStr pointer is passed to faccessat
     cerr(unsafe { libc::faccessat(parent.as_raw_fd(), path.as_ptr(), mode, flags) }).map(|_| ())
 }
@@ -442,7 +449,7 @@ fn traversed_secure_open(
             ));
         }
 
-        #[cfg(any(test, target_os = "macos"))]
+        #[cfg(test)]
         let user_has_write_perms = {
             // During testing we do a less comprehensive check as we don't have
             // permission to set the real user id to arbitrary users, but faccessat
@@ -454,7 +461,9 @@ fn traversed_secure_open(
                 || (perms & mode(Category::Owner, Op::Write) != 0)
                     && forbidden_user.uid.inner() == meta.uid()
         };
-        #[cfg(not(any(test, target_os = "macos")))]
+        #[cfg(all(not(test), target_os = "macos"))]
+        let user_has_write_perms = super::macos::real_user_can_write(file.as_fd(), forbidden_user)?;
+        #[cfg(all(not(test), any(target_os = "linux", target_os = "freebsd")))]
         let user_has_write_perms = {
             // Only works when forbidden_user is current user. This is enforced
             // by accepting CurrentUser outside of test mode.

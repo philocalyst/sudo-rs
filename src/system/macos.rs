@@ -1,8 +1,14 @@
 //! Darwin process queries. Keep the platform ABI details out of the execution pipeline.
 
-use std::{io, mem::MaybeUninit};
+use std::{
+    io,
+    mem::MaybeUninit,
+    os::fd::{AsRawFd, BorrowedFd},
+};
 
 use super::{GroupId, Process, UserId, WithProcess, set_cloexec};
+
+mod acl;
 
 /// membership.h includes nested Open Directory memberships that need not appear
 /// in getgroups/getgrouplist's advisory group list. These APIs return errno
@@ -37,6 +43,83 @@ pub(super) fn is_group_member(uid: UserId, gid: GroupId) -> io::Result<bool> {
         libc::ENOENT => Ok(false),
         _ => Err(io::Error::from_raw_os_error(result)),
     }
+}
+
+/// Ask the kernel about access to the opened vnode, including ACLs, as the
+/// invoking user. A path-based access check would introduce a rename race.
+pub(super) fn real_user_can_write(fd: BorrowedFd<'_>, user: &super::User) -> io::Result<bool> {
+    if kernel_real_user_can_write(fd)? {
+        return Ok(true);
+    }
+    // Darwin W_OK aggregates directory rights. A partial ACL can permit
+    // add_file or delete_child without granting W_OK, so inspect the ordered
+    // ACL and its remaining POSIX fallback rights on the same opened vnode.
+    acl::permits_mutation(fd, user)
+}
+
+fn kernel_real_user_can_write(fd: BorrowedFd<'_>) -> io::Result<bool> {
+    struct RestoreEuid(libc::uid_t);
+    impl Drop for RestoreEuid {
+        fn drop(&mut self) {
+            // SAFETY: seteuid does not access memory and restores the saved identity.
+            crate::cutils::cerr(unsafe { libc::seteuid(self.0) })
+                .expect("could not restore effective user id");
+        }
+    }
+    // SAFETY: these credential queries cannot fail or cause memory unsafety.
+    let (real, effective) = unsafe { (libc::getuid(), libc::geteuid()) };
+    let _restore = if real != effective {
+        // SAFETY: only the effective identity changes; saved root is preserved.
+        crate::cutils::cerr(unsafe { libc::seteuid(real) })?;
+        Some(RestoreEuid(effective))
+    } else {
+        None
+    };
+    let mut attrs = libc::attrlist {
+        bitmapcount: libc::ATTR_BIT_MAP_COUNT,
+        reserved: 0,
+        commonattr: libc::ATTR_CMN_RETURNED_ATTRS | libc::ATTR_CMN_USERACCESS,
+        volattr: 0,
+        dirattr: 0,
+        fileattr: 0,
+        forkattr: 0,
+    };
+    #[repr(C)]
+    struct Access {
+        length: u32,
+        returned: libc::attribute_set_t,
+        access: u32,
+    }
+    let mut access = MaybeUninit::<Access>::uninit();
+    // SAFETY: fgetattrlist receives valid attribute masks and a correctly sized,
+    // aligned output buffer containing only integer fields.
+    crate::cutils::cerr(unsafe {
+        libc::fgetattrlist(
+            fd.as_raw_fd(),
+            (&mut attrs as *mut libc::attrlist).cast(),
+            access.as_mut_ptr().cast(),
+            size_of::<Access>(),
+            0,
+        )
+    })?;
+    // Only read the leading length until the kernel confirms the whole buffer.
+    // SAFETY: a successful fgetattrlist always writes the initial u32 length.
+    let length = unsafe { access.as_ptr().cast::<u32>().read() };
+    if length as usize != size_of::<Access>() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "incomplete file access attributes",
+        ));
+    }
+    // SAFETY: the kernel returned all bytes of Access.
+    let access = unsafe { access.assume_init() };
+    if access.returned.commonattr & libc::ATTR_CMN_USERACCESS == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "file access attributes unavailable",
+        ));
+    }
+    Ok(access.access & libc::W_OK as u32 != 0)
 }
 
 pub(super) fn process_info(process: WithProcess) -> io::Result<libc::proc_bsdinfo> {
@@ -153,6 +236,162 @@ mod tests {
     fn directory_membership_recognizes_the_primary_group() {
         let user = super::super::User::real().unwrap().unwrap();
         assert!(is_group_member(user.uid, user.gid).unwrap());
+    }
+
+    #[test]
+    fn vnode_access_check_includes_acl_write_permissions() {
+        use std::{
+            fs::{self, File},
+            os::{fd::AsFd, unix::fs::PermissionsExt},
+            process::Command,
+        };
+        let user = super::super::User::real().unwrap().unwrap();
+        let dir = super::super::file::create_temporary_dir().unwrap();
+        let path = dir.join("acl-test");
+        let file = File::create(&path).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        assert!(real_user_can_write(file.as_fd(), &user).unwrap());
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o400)).unwrap();
+        // SAFETY: getuid/geteuid are always safe to call.
+        let (uid, euid) = unsafe { (libc::getuid(), libc::geteuid()) };
+        if uid != 0 {
+            assert!(!real_user_can_write(file.as_fd(), &user).unwrap());
+            let name = &user.name;
+            let rule = format!("user:{name} allow write");
+            assert!(
+                Command::new("/bin/chmod")
+                    .args(["+a", &rule])
+                    .arg(&path)
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+            assert_eq!(file.metadata().unwrap().permissions().mode() & 0o200, 0);
+            assert!(real_user_can_write(file.as_fd(), &user).unwrap());
+        }
+        // SAFETY: geteuid is always safe to call.
+        assert_eq!(unsafe { libc::geteuid() }, euid);
+        fs::remove_file(path).unwrap();
+        fs::remove_dir(dir).unwrap();
+    }
+
+    #[test]
+    fn partial_acl_rights_and_order_are_checked_on_the_vnode() {
+        use std::{
+            fs::{self, File, OpenOptions},
+            io::Write,
+            os::{fd::AsFd, unix::fs::PermissionsExt},
+            process::Command,
+        };
+        let user = super::super::User::real().unwrap().unwrap();
+        if user.uid == UserId::ROOT {
+            return; // The native root suite separately exercises a real invoking UID.
+        }
+        let dir = super::super::file::create_temporary_dir().unwrap();
+        let path = dir.join("partial-acl");
+        let file = File::create(&path).unwrap();
+        let rule = |path: &std::path::Path, operation: &str, rights: &str| {
+            assert!(
+                Command::new("/bin/chmod")
+                    .args([operation, &format!("user:{} {rights}", user.name)])
+                    .arg(path)
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+        };
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o400)).unwrap();
+        rule(&path, "+a", "allow append");
+        assert!(!kernel_real_user_can_write(file.as_fd()).unwrap());
+        OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap()
+            .write_all(b"append")
+            .unwrap();
+        assert!(real_user_can_write(file.as_fd(), &user).unwrap());
+        assert!(
+            Command::new("/bin/chmod")
+                .args(["+a#", "0", &format!("user:{} deny append", user.name)])
+                .arg(&path)
+                .status()
+                .unwrap()
+                .success()
+        );
+        assert!(OpenOptions::new().append(true).open(&path).is_err());
+        assert!(!real_user_can_write(file.as_fd(), &user).unwrap());
+        // Denying data writes does not remove the POSIX grant to append.
+        assert!(
+            Command::new("/bin/chmod")
+                .arg("-N")
+                .arg(&path)
+                .status()
+                .unwrap()
+                .success()
+        );
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        rule(&path, "+a", "deny write");
+        assert!(OpenOptions::new().write(true).open(&path).is_err());
+        OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap()
+            .write_all(b"more")
+            .unwrap();
+        assert!(real_user_can_write(file.as_fd(), &user).unwrap());
+        assert!(
+            Command::new("/bin/chmod")
+                .arg("-N")
+                .arg(&path)
+                .status()
+                .unwrap()
+                .success()
+        );
+        fs::remove_file(path).unwrap();
+        let directory = File::open(&dir).unwrap();
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o500)).unwrap();
+        rule(&dir, "+a", "allow add_file,delete_child");
+        assert!(!kernel_real_user_can_write(directory.as_fd()).unwrap());
+        File::create(dir.join("created")).unwrap();
+        assert!(real_user_can_write(directory.as_fd(), &user).unwrap());
+        fs::remove_file(dir.join("created")).unwrap();
+        assert!(
+            Command::new("/bin/chmod")
+                .args([
+                    "+a#",
+                    "0",
+                    &format!("user:{} deny add_file,delete_child", user.name)
+                ])
+                .arg(&dir)
+                .status()
+                .unwrap()
+                .success()
+        );
+        assert!(File::create(dir.join("denied")).is_err());
+        assert!(!real_user_can_write(directory.as_fd(), &user).unwrap());
+        assert!(
+            Command::new("/bin/chmod")
+                .arg("-N")
+                .arg(&dir)
+                .status()
+                .unwrap()
+                .success()
+        );
+        rule(
+            &dir,
+            "+a",
+            "allow add_file,file_inherit,directory_inherit,only_inherit",
+        );
+        assert!(!real_user_can_write(directory.as_fd(), &user).unwrap());
+        assert!(
+            Command::new("/bin/chmod")
+                .arg("-N")
+                .arg(&dir)
+                .status()
+                .unwrap()
+                .success()
+        );
+        fs::remove_dir(dir).unwrap();
     }
 
     #[test]
