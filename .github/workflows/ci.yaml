@@ -184,6 +184,7 @@ jobs:
   build-and-test:
     runs-on: "${{ matrix.os }}"
     strategy:
+      fail-fast: false
       matrix:
         include:
           - os: ubuntu-latest
@@ -195,6 +196,7 @@ jobs:
           persist-credentials: false
 
       - name: Correct permissions
+        if: matrix.os == 'ubuntu-latest'
         run: sudo chmod -R 755 /usr/share
 
       - name: Install llvm-tools component
@@ -219,6 +221,10 @@ jobs:
 
       - name: Run tests
         run: cargo test --workspace --all-targets --release
+
+      - name: Lint macOS platform code
+        if: matrix.os == 'macos-latest'
+        run: cargo clippy --workspace --all-targets -- --deny warnings
 
   build-and-test-minimal:
     runs-on: ubuntu-latest
