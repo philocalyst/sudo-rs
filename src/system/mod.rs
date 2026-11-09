@@ -17,9 +17,9 @@ use crate::{
 use interface::{DeviceId, GroupId, ProcessId, UserId};
 pub use libc::PATH_MAX;
 use libc::STDERR_FILENO;
-#[cfg(not(target_os = "macos"))]
+#[cfg(any(target_os = "linux", target_os = "freebsd"))]
 use libc::{CLOSE_RANGE_CLOEXEC, EINVAL, ENOSYS};
-#[cfg(not(target_os = "macos"))]
+#[cfg(any(target_os = "linux", target_os = "freebsd"))]
 use std::ffi::c_uint;
 use time::ProcessCreateTime;
 
@@ -56,7 +56,7 @@ fn set_cloexec(fd: c_int) -> io::Result<()> {
 
 /// Attempts close_range(CLOSE_RANGE_CLOEXEC) for all fds >= lowfd.
 /// Returns Ok(true) on success, Ok(false) if unsupported, Err on any other failure.
-#[cfg(not(target_os = "macos"))]
+#[cfg(any(target_os = "linux", target_os = "freebsd"))]
 fn try_close_range(lowfd: c_int) -> io::Result<bool> {
     // SAFETY: this function is safe to call:
     // - any errors while closing a specific fd will be effectively ignored
@@ -135,10 +135,16 @@ fn try_proc_pidinfo(lowfd: c_int) -> io::Result<bool> {
     Ok(true)
 }
 
-/// Sets CLOEXEC on all fds >= lowfd by walking an fd directory
-/// (/proc/self/fd on Linux/FreeBSD, /dev/fd on macOS).
-fn cloexec_via_fd_dir(lowfd: c_int, path: &str) -> io::Result<()> {
-    for entry in fs::read_dir(path)? {
+/// The directory that lists our open fds: procfs on Linux, fdescfs everywhere else.
+const FD_DIR: &str = if cfg!(target_os = "linux") {
+    "/proc/self/fd"
+} else {
+    "/dev/fd"
+};
+
+/// Sets CLOEXEC on all fds >= lowfd by walking [`FD_DIR`].
+fn cloexec_via_fd_dir(lowfd: c_int) -> io::Result<()> {
+    for entry in fs::read_dir(FD_DIR)? {
         let file_name = entry?.file_name();
 
         if file_name == "." || file_name == ".." {
@@ -166,25 +172,18 @@ fn cloexec_via_fd_dir(lowfd: c_int, path: &str) -> io::Result<()> {
 pub(crate) fn mark_fds_as_cloexec() -> io::Result<()> {
     let lowfd = STDERR_FILENO + 1;
 
-    // The kernel doesn't support close_range or CLOSE_RANGE_CLOEXEC,
-    // so our fallback on all platforms to finding all open fds using /proc/self/fd.
-
-    #[cfg(not(target_os = "macos"))]
-    {
-        if try_close_range(lowfd)? {
-            return Ok(());
-        }
-
-        cloexec_via_fd_dir(lowfd, "/proc/self/fd")
+    // Prefer an interface that does this in one go; if the kernel doesn't
+    // offer one, fall back to walking the directory of open fds.
+    #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+    if try_close_range(lowfd)? {
+        return Ok(());
     }
-
     #[cfg(target_os = "macos")]
-    {
-        if try_proc_pidinfo(lowfd)? {
-            return Ok(());
-        }
-        cloexec_via_fd_dir(lowfd, "/dev/fd")
+    if try_proc_pidinfo(lowfd)? {
+        return Ok(());
     }
+
+    cloexec_via_fd_dir(lowfd)
 }
 
 pub(crate) enum ForkResult {
