@@ -21,10 +21,8 @@ mod rpassword;
 mod securemem;
 
 #[cfg_attr(target_os = "linux", path = "sys_linuxpam.rs")]
-#[cfg_attr(
-    any(target_os = "freebsd", target_os = "macos"),
-    path = "sys_openpam.rs"
-)]
+#[cfg_attr(target_os = "freebsd", path = "sys_openpam.rs")]
+#[cfg_attr(target_os = "macos", path = "sys_macos.rs")]
 #[allow(nonstandard_style)]
 pub mod sys;
 

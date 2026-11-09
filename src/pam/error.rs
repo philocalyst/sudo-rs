@@ -57,7 +57,8 @@ pub enum PamErrorType {
     TryAgain,
     ModuleUnknown,
     /// The application tried to set/delete an undefined or inaccessible item.
-    BadItem, // Extension in OpenPAM and LinuxPAM
+    #[cfg(not(target_os = "macos"))]
+    BadItem, // Extension in FreeBSD OpenPAM and LinuxPAM
     // DomainUnknown, // OpenPAM only
     // BadHandle // OpenPAM only
     // BadFeature // OpenPAM only
@@ -101,6 +102,7 @@ impl PamErrorType {
             PAM_ABORT => Abort,
             PAM_TRY_AGAIN => TryAgain,
             PAM_MODULE_UNKNOWN => ModuleUnknown,
+            #[cfg(not(target_os = "macos"))]
             PAM_BAD_ITEM => BadItem,
             // PAM_DOMAIN_UNKNOWN => DomainUnknown,
             // PAM_BAD_HANDLE => BadHandle,
@@ -145,6 +147,7 @@ impl PamErrorType {
             Abort => PAM_ABORT as c_int,
             TryAgain => PAM_TRY_AGAIN as c_int,
             ModuleUnknown => PAM_MODULE_UNKNOWN as c_int,
+            #[cfg(not(target_os = "macos"))]
             BadItem => PAM_BAD_ITEM as c_int,
             // DomainUnknown => PAM_DOMAIN_UNKNOWN as c_int,
             // BadHandle => PAM_BAD_HANDLE as c_int,
