@@ -25,6 +25,8 @@ use time::ProcessCreateTime;
 use self::signal::SignalNumber;
 
 pub(crate) mod audit;
+#[cfg(target_os = "macos")]
+mod macos;
 // generalized traits for when we want to hide implementations
 pub mod interface;
 
@@ -87,7 +89,22 @@ pub(crate) fn mark_fds_as_cloexec() -> io::Result<()> {
 
 #[cfg(target_os = "macos")]
 pub(crate) fn mark_fds_as_cloexec() -> io::Result<()> {
-    mark_fds_as_cloexec_fallback(STDERR_FILENO + 1)
+    let lowfd = STDERR_FILENO + 1;
+    // Enumerate through the kernel's process table; fall back to /dev/fd if that is unavailable.
+    if macos::mark_fds_as_cloexec(lowfd)? {
+        return Ok(());
+    }
+    mark_fds_as_cloexec_fallback(lowfd)
+}
+
+fn set_cloexec(fd: c_int) -> io::Result<()> {
+    // SAFETY: This only sets the CLOEXEC flag; it does not close or invalidate the fd.
+    match unsafe { cerr(libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC)) } {
+        Ok(_) => Ok(()),
+        // An enumerated descriptor may have disappeared since the snapshot.
+        Err(err) if err.raw_os_error() == Some(libc::EBADF) => Ok(()),
+        Err(err) => Err(err),
+    }
 }
 
 fn mark_fds_as_cloexec_fallback(lowfd: i32) -> io::Result<()> {
@@ -117,11 +134,8 @@ fn mark_fds_as_cloexec_fallback(lowfd: i32) -> io::Result<()> {
         if fd < lowfd {
             continue;
         }
-        // SAFETY: This only sets the CLOEXEC flag for the given fd. Nothing is
-        // going to need it after exec.
-        unsafe {
-            cerr(libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC))?;
-        }
+        // Nothing is going to need the fd after exec.
+        set_cloexec(fd)?;
     }
 
     Ok(())
@@ -988,6 +1002,45 @@ mod tests {
             .write(true)
             .create_new(true)
             .open(path)
+    }
+
+    fn check_descriptor_inheritance(mark: impl Fn()) {
+        let child = unsafe {
+            fork_for_test(|| {
+                let file = std::fs::File::open("/dev/null").unwrap();
+                // F_DUPFD deliberately creates a sparse, inheritable descriptor.
+                let fd =
+                    crate::cutils::cerr(libc::fcntl(file.as_raw_fd(), libc::F_DUPFD, 128)).unwrap();
+                let open_in_child = |expected: bool| {
+                    let op = if expected { "-e" } else { "! -e" };
+                    std::process::Command::new("/bin/sh")
+                        .args(["-c", &format!("test {op} /dev/fd/{fd}")])
+                        .status()
+                        .unwrap()
+                        .success()
+                };
+                assert!(
+                    open_in_child(true),
+                    "control: descriptor must survive exec before marking"
+                );
+                mark();
+                assert!(open_in_child(false), "descriptor leaked through exec");
+                assert_eq!(libc::close(fd), 0);
+                exit(0);
+            })
+        };
+        let (_, status) = child.wait(WaitOptions::new()).unwrap();
+        assert_eq!(status.exit_status(), Some(0));
+    }
+
+    #[test]
+    fn cloexec_prevents_descriptor_inheritance() {
+        check_descriptor_inheritance(|| super::mark_fds_as_cloexec().unwrap());
+    }
+
+    #[test]
+    fn fd_directory_fallback_prevents_descriptor_inheritance() {
+        check_descriptor_inheritance(|| super::mark_fds_as_cloexec_fallback(3).unwrap());
     }
 
     #[test]
