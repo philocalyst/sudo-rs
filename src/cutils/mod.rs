@@ -1,7 +1,7 @@
 use std::{
     ffi::{CStr, OsStr, OsString, c_char, c_int, c_long},
     os::{
-        fd::{AsRawFd, BorrowedFd},
+        fd::{AsRawFd, BorrowedFd, FromRawFd, OwnedFd},
         unix::prelude::OsStrExt,
     },
 };
@@ -136,33 +136,26 @@ pub fn dynamic_fill<T: Default + Copy, E>(
     }
 }
 
-#[cfg(target_os = "macos")]
-/// # Safety
-/// Same as `libc::pipe`.
-pub unsafe extern "C" fn pipe2(fds: *mut c_int, flags: c_int) -> c_int {
-    // SAFETY: the caller has to ensure this call is safe
+/// Create a pipe whose ends will not survive exec.
+/// On macOS, creation and setting CLOEXEC are separate operations. As with the
+/// rest of the execution pipeline, callers must not concurrently fork/exec.
+pub fn pipe_cloexec() -> std::io::Result<(OwnedFd, OwnedFd)> {
+    let mut fds = [-1; 2];
+    // SAFETY: both functions receive space for exactly two descriptors.
     unsafe {
-        if libc::pipe(fds) == -1 {
-            return -1;
-        }
+        #[cfg(target_os = "macos")]
+        cerr(libc::pipe(fds.as_mut_ptr()))?;
+        #[cfg(not(target_os = "macos"))]
+        cerr(libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC))?;
     }
-
-    // SAFETY: this is safe due to the contract on fcntl(2)
-    let setflag = |fd| unsafe {
-        let flag = cerr(libc::fcntl(fd, libc::F_GETFL))?;
-        cerr(libc::fcntl(fd, libc::F_SETFL, flag | flags))
-    };
-
-    // SAFETY: the caller will have ensured fds points to two c_int's
-    unsafe {
-        if setflag(*fds).is_err() || setflag(*fds.add(1)).is_err() {
-            let _ = libc::close(*fds);
-            let _ = libc::close(*fds.add(1));
-            return -1;
-        };
+    // SAFETY: a successful pipe call initialized two new, owned descriptors.
+    let pair = unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) };
+    #[cfg(target_os = "macos")]
+    for fd in [&pair.0, &pair.1] {
+        // SAFETY: F_SETFD only changes flags on our newly created descriptor.
+        cerr(unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_SETFD, libc::FD_CLOEXEC) })?;
     }
-
-    0
+    Ok(pair)
 }
 
 #[allow(clippy::undocumented_unsafe_blocks)]
@@ -170,6 +163,26 @@ pub unsafe extern "C" fn pipe2(fds: *mut c_int, flags: c_int) -> c_int {
 mod test {
 
     use super::{dynamic_fill, os_string_from_ptr, string_from_ptr};
+
+    #[test]
+    fn pipe_is_cloexec_and_transfers_data() {
+        use std::io::{Read, Write};
+        use std::os::fd::AsRawFd;
+        let (rx, tx) = super::pipe_cloexec().unwrap();
+        for fd in [&rx, &tx] {
+            let flags = super::cerr(unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_GETFD) }).unwrap();
+            assert_ne!(flags & libc::FD_CLOEXEC, 0);
+            let flags = super::cerr(unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_GETFL) }).unwrap();
+            assert_eq!(flags & libc::O_NONBLOCK, 0);
+        }
+        let mut rx = std::fs::File::from(rx);
+        let mut tx = std::fs::File::from(tx);
+        tx.write_all(b"pipe data").unwrap();
+        drop(tx);
+        let mut data = Vec::new();
+        rx.read_to_end(&mut data).unwrap();
+        assert_eq!(data, b"pipe data");
+    }
 
     #[test]
     fn miri_test_str_to_ptr() {
