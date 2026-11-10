@@ -749,11 +749,11 @@ impl Process {
     }
 
     #[cfg(any(target_os = "freebsd", target_os = "netbsd"))]
-    fn get_proc_info(pid: WithProcess) -> std::io::Result<libc::kinfo_proc> {
+    fn get_proc_info(pid: WithProcess) -> std::io::Result<KinfoProc> {
         use std::ffi::c_void;
         use std::ptr;
 
-        let mut ki_proc: Vec<libc::kinfo_proc> = Vec::with_capacity(1);
+        let mut ki_proc: Vec<KinfoProc> = Vec::with_capacity(1);
 
         let pid = match pid {
             WithProcess::Current => std::process::id() as i32,
@@ -761,21 +761,24 @@ impl Process {
         };
 
         loop {
-            let mut size = ki_proc.capacity() * size_of::<libc::kinfo_proc>();
+            let mut size = ki_proc.capacity() * size_of::<KinfoProc>();
             // SAFETY: KERN_PROC_PID only reads data into the ki_proc list. It
             // does not write more than `size` bytes to the pointer.
             match cerr(unsafe {
                 libc::sysctl(
                     [
                         libc::CTL_KERN,
+                        #[cfg(target_os = "freebsd")]
                         libc::KERN_PROC,
+                        #[cfg(target_os = "netbsd")]
+                        libc::KERN_PROC2,
                         libc::KERN_PROC_PID,
                         pid,
-                        size_of::<libc::kinfo_proc>() as i32,
+                        size_of::<KinfoProc>() as i32,
                         1,
                     ]
                     .as_ptr(),
-                    4,
+                    if cfg!(target_os = "freebsd") { 4 } else { 6 },
                     ki_proc.as_mut_ptr().cast::<c_void>(),
                     &mut size,
                     ptr::null(),
@@ -783,7 +786,7 @@ impl Process {
                 )
             }) {
                 Ok(_) => {
-                    assert!(size >= size_of::<libc::kinfo_proc>());
+                    assert!(size >= size_of::<KinfoProc>());
                     // SAFETY: The above sysctl has initialized at least `size` bytes. We have
                     // asserted that this is at least a single element.
                     unsafe {
@@ -808,10 +811,15 @@ impl Process {
     pub fn tty_device_id(pid: WithProcess) -> std::io::Result<Option<DeviceId>> {
         let ki_proc = Self::get_proc_info(pid)?;
 
-        if ki_proc.ki_tdev == !0 {
+        #[cfg(target_os = "freebsd")]
+        let dev_nr = ki_proc.ki_tdev;
+        #[cfg(target_os = "netbsd")]
+        let dev_nr = ki_proc.p_tdev.into();
+
+        if dev_nr == !0 {
             Ok(None)
         } else {
-            Ok(Some(DeviceId::new(ki_proc.ki_tdev)))
+            Ok(Some(DeviceId::new(dev_nr)))
         }
     }
 
@@ -838,14 +846,28 @@ impl Process {
     pub fn starting_time(pid: WithProcess) -> io::Result<ProcessCreateTime> {
         let ki_proc = Self::get_proc_info(pid)?;
 
-        let ki_start = ki_proc.ki_start;
+        #[cfg(target_os = "freebsd")]
+        let (sec, usec) = {
+            let timeval = ki_proc.ki_start;
+            (timeval.tv_sec, timeval.tv_usec)
+        };
+
+        #[cfg(target_os = "netbsd")]
+        let (sec, usec) = { (ki_proc.p_ustart_sec, ki_proc.p_ustart_usec) };
+
         #[allow(clippy::useless_conversion)]
         Ok(ProcessCreateTime::new(
-            i64::from(ki_start.tv_sec),
-            i64::from(ki_start.tv_usec) * 1000,
+            i64::from(sec),
+            i64::from(usec) * 1000,
         ))
     }
 }
+
+#[cfg(target_os = "freebsd")]
+type KinfoProc = libc::kinfo_proc;
+
+#[cfg(target_os = "netbsd")]
+type KinfoProc = libc::kinfo_proc2;
 
 /// Read the n-th field (with 0-based indexing) from `/proc/<pid>/self`.
 ///
