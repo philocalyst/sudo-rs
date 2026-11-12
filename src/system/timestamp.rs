@@ -35,8 +35,10 @@ pub struct SessionRecordFile {
 impl SessionRecordFile {
     #[cfg(any(target_os = "linux", target_os = "freebsd", target_os = "netbsd"))]
     const BASE_PATH: &'static str = "/var/run/sudo-rs/ts";
+    // Records hold values of SystemTime::now and only compare with values of the same
+    // clock, so this directory must never hold records written with another clock.
     #[cfg(target_os = "macos")]
-    const BASE_PATH: &'static str = "/var/db/sudo-rs/ts";
+    const BASE_PATH: &'static str = "/var/db/sudo-rs/ts-raw";
 
     pub fn open_for_user(user: &CurrentUser, timeout: Duration) -> io::Result<Self> {
         let uid = user.uid;
@@ -724,6 +726,16 @@ mod tests {
         f.rewind()?;
         f.read_to_end(&mut v)?;
         Ok(v)
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_records_are_kept_apart_from_older_clock_records() {
+        // builds that used CLOCK_MONOTONIC kept their records in /var/db/sudo-rs/ts;
+        // read with CLOCK_MONOTONIC_RAW, those could stay valid past the timeout
+        let base = Path::new(SessionRecordFile::BASE_PATH);
+        let old = Path::new("/var/db/sudo-rs/ts");
+        assert!(!base.starts_with(old) && !old.starts_with(base));
     }
 
     #[test]
