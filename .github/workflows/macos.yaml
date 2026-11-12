@@ -1,0 +1,62 @@
+name: macOS
+
+permissions: {}
+
+on:
+  push:
+  pull_request:
+  merge_group:
+
+jobs:
+  macos:
+    name: macOS arm64 unit tests and clippy
+    runs-on: macos-15
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Toolchain and platform
+        run: |
+          uname -a
+          rustc --version
+          cargo --version
+          xcrun --show-sdk-path
+          id
+      - run: cargo test --workspace --all-targets --release
+      - run: cargo clippy --all-targets -- --deny warnings
+      - name: Check supported optional features
+        run: |
+          for feature in pam-login apparmor unstable-remote-sudoers; do
+            cargo check --all-targets --features "$feature"
+          done
+      - name: Check PAM declarations against the SDK
+        # P6 supplies the checker; independent P8 can still run before stacking.
+        run: |
+          if test -f util/check-pam-abi.sh; then
+            sh util/check-pam-abi.sh
+          fi
+      - name: Check unsupported gettext diagnostic
+        # P7 makes this explicit; never load a user-owned package-manager dylib.
+        run: |
+          if cargo check --features gettext >gettext.log 2>&1; then
+            echo 'gettext rejection requires P7 to be stacked' >&2
+            exit 1
+          fi
+          grep -F 'gettext on macOS requires a supported system libintl installation' gettext.log
+
+  native:
+    # Enable only after P9 and its disposable-host setup have been reviewed.
+    if: ${{ false }}
+    name: macOS privileged native tests
+    runs-on: macos-15
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Run on the disposable hosted runner
+        run: |
+          sudo env "CARGO=$(command -v cargo)" "RUSTC=$(command -v rustc)" \
+            "RUSTUP_HOME=$HOME/.rustup" "CARGO_HOME=$HOME/.cargo" \
+            sh test-framework/native-tests/run.sh --disposable
