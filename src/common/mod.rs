@@ -27,15 +27,17 @@ pub const HARDENED_ENUM_VALUE_3: u32 = 0x1629e037; // 00101100010100111100000001
 pub const HARDENED_ENUM_VALUE_4: u32 = 0x1fc8d3ac; // 11111110010001101001110101100
 pub const HARDENED_ENUM_VALUE_5: u32 = 0x70372c52; // 1110000001101110010110001010011
 
-#[cfg_attr(not(feature = "dev"), allow(dead_code))]
+/// Exit, with a warning, unless SUDO_RS_IS_UNSTABLE acknowledges that sudo-rs may break the
+/// system. This is an acknowledgement, not a security boundary.
 pub(crate) fn unstable_warning() {
     let check_var = std::env::var("SUDO_RS_IS_UNSTABLE").unwrap_or_default();
 
     if check_var != "I accept that my system may break unexpectedly" {
         eprintln_ignore_io_error!(
             "WARNING!
-Sudo-rs is compiled with development logs on, which means it is less secure and could potentially
-break your system. We recommend that you do not run this on any production environment.
+Sudo-rs is compiled with development logs on, or runs on a platform it does not support yet,
+which means it is less secure and could potentially break your system. We recommend that you
+do not run this on any production environment.
 To turn off this warning and use sudo-rs you need to set the environment variable
 SUDO_RS_IS_UNSTABLE to the value `I accept that my system may break unexpectedly`."
         );
@@ -62,5 +64,53 @@ impl fmt::Display for DisplayOsStr<'_> {
             f.write_char(char::REPLACEMENT_CHARACTER)?;
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::process::{Command, Stdio};
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn unstable_warning_needs_the_exact_acknowledgement() {
+        const CHILD: &str = "SUDO_RS_TEST_UNSTABLE_WARNING";
+        if std::env::var_os(CHILD).is_some() {
+            super::unstable_warning();
+            crate::system::_exit(42);
+        }
+
+        // unstable_warning exits the process, so it runs in a fresh copy of the test binary
+        let accept = "I accept that my system may break unexpectedly";
+        for (value, status) in [(None, 1), (Some("yes"), 1), (Some(accept), 42)] {
+            let mut command = Command::new(std::env::current_exe().unwrap());
+            command
+                .args([
+                    "--exact",
+                    "common::tests::unstable_warning_needs_the_exact_acknowledgement",
+                ])
+                .env(CHILD, "1")
+                .env_remove("SUDO_RS_IS_UNSTABLE")
+                .stdout(Stdio::null())
+                .stderr(Stdio::null());
+            if let Some(value) = value {
+                command.env("SUDO_RS_IS_UNSTABLE", value);
+            }
+            let mut child = command.spawn().unwrap();
+            let deadline = Instant::now() + Duration::from_secs(60);
+            let exit = loop {
+                if let Some(exit) = child.try_wait().unwrap() {
+                    break exit;
+                }
+                if Instant::now() > deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    panic!("the test process did not exit within 60 seconds");
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            };
+            // exits with 1 when refusing; 42 only after unstable_warning returned
+            assert_eq!(exit.code(), Some(status), "SUDO_RS_IS_UNSTABLE={value:?}");
+        }
     }
 }
