@@ -167,6 +167,11 @@ unsafe extern "C" fn pipe2(fds: *mut c_int, flags: c_int) -> c_int {
 
     // SAFETY: this is safe due to the contract on fcntl(2)
     let setflag = |fd| unsafe {
+        // F_SETFL ignores O_CLOEXEC: it is not a file status flag, but stands
+        // for the FD_CLOEXEC descriptor flag, which is set with F_SETFD.
+        if flags & libc::O_CLOEXEC != 0 {
+            cerr(libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC))?;
+        }
         let flag = cerr(libc::fcntl(fd, libc::F_GETFL))?;
         cerr(libc::fcntl(fd, libc::F_SETFL, flag | flags))
     };
@@ -188,6 +193,15 @@ unsafe extern "C" fn pipe2(fds: *mut c_int, flags: c_int) -> c_int {
 mod test {
 
     use super::{dynamic_fill, os_string_from_ptr, string_from_ptr};
+
+    #[test]
+    fn pipe_ends_are_close_on_exec() {
+        use std::os::fd::AsRawFd;
+        for end in super::mkpipe().unwrap() {
+            let flags = unsafe { libc::fcntl(end.as_raw_fd(), libc::F_GETFD) };
+            assert_eq!(flags, libc::FD_CLOEXEC);
+        }
+    }
 
     #[test]
     fn miri_test_str_to_ptr() {
