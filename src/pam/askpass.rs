@@ -10,7 +10,7 @@ use crate::system::{ForkResult, audit, fork, mark_fds_as_cloexec};
 
 pub(super) fn spawn_askpass(program: &Path, prompt: &str) -> io::Result<(ProcessId, OwnedFd)> {
     // Create socket
-    let [pipe_read, pipe_write] = crate::cutils::mkpipe()?;
+    let [pipe_read, pipe_write] = crate::cutils::pipe()?;
 
     // Spawn child
     // SAFETY: There should be no other threads at this point.

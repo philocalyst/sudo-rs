@@ -136,51 +136,30 @@ pub fn dynamic_fill<T: Default + Copy, E>(
     }
 }
 
-/// A memory safe wrapper around libc::pipe2
-pub fn mkpipe() -> std::io::Result<[OwnedFd; 2]> {
-    let mut pipes = [-1, 1];
-    // SAFETY: A valid pointer to a mutable array of 2 fds is passed in.
-    cerr(unsafe { pipe2(pipes.as_mut_ptr(), libc::O_CLOEXEC) })?;
+/// Create a pipe whose two ends are closed on exec.
+pub fn pipe() -> std::io::Result<[OwnedFd; 2]> {
+    let mut pipes = [-1; 2];
+    // SAFETY: both calls initialize exactly two descriptors on success.
+    #[cfg(any(target_os = "linux", target_os = "freebsd", target_os = "netbsd"))]
+    cerr(unsafe { libc::pipe2(pipes.as_mut_ptr(), libc::O_CLOEXEC) })?;
+    // SAFETY: pipes has room for both descriptors.
+    #[cfg(target_os = "macos")]
+    cerr(unsafe { libc::pipe(pipes.as_mut_ptr()) })?;
 
     let pipes = pipes.map(|fd| {
-        // SAFETY: pipe2 created two owned pipe fds.
+        // SAFETY: pipe/pipe2 returned two new, owned descriptors.
         unsafe { OwnedFd::from_raw_fd(fd) }
     });
-
+    #[cfg(target_os = "macos")]
+    for fd in &pipes {
+        use std::os::fd::AsRawFd;
+        // macOS has no pipe2. FD_CLOEXEC is a descriptor flag (F_SETFD),
+        // not a file status flag (F_SETFL). OwnedFd closes both on failure.
+        // This is not atomic with a concurrent fork/exec.
+        // SAFETY: F_SETFD takes an integer flag, not a pointer.
+        cerr(unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_SETFD, libc::FD_CLOEXEC) })?;
+    }
     Ok(pipes)
-}
-
-#[cfg(not(target_os = "macos"))]
-use libc::pipe2;
-
-#[cfg(target_os = "macos")]
-/// # Safety
-///
-/// The same as libc::pipe
-unsafe extern "C" fn pipe2(fds: *mut c_int, flags: c_int) -> c_int {
-    // SAFETY: the caller has to ensure this call is safe
-    unsafe {
-        if libc::pipe(fds) == -1 {
-            return -1;
-        }
-    }
-
-    // SAFETY: this is safe due to the contract on fcntl(2)
-    let setflag = |fd| unsafe {
-        let flag = cerr(libc::fcntl(fd, libc::F_GETFL))?;
-        cerr(libc::fcntl(fd, libc::F_SETFL, flag | flags))
-    };
-
-    // SAFETY: the caller will have ensured fds points to two c_int's
-    unsafe {
-        if setflag(*fds).is_err() || setflag(*fds.add(1)).is_err() {
-            let _ = libc::close(*fds);
-            let _ = libc::close(*fds.add(1));
-            return -1;
-        };
-    }
-
-    0
 }
 
 #[allow(clippy::undocumented_unsafe_blocks)]
@@ -188,6 +167,25 @@ unsafe extern "C" fn pipe2(fds: *mut c_int, flags: c_int) -> c_int {
 mod test {
 
     use super::{dynamic_fill, os_string_from_ptr, string_from_ptr};
+
+    #[test]
+    fn pipe_ends_are_cloexec_and_carry_data() {
+        use std::io::{Read, Write};
+        use std::os::fd::AsRawFd;
+        let [read, write] = super::pipe().unwrap();
+        for pipe in [&read, &write] {
+            assert_eq!(
+                unsafe { libc::fcntl(pipe.as_raw_fd(), libc::F_GETFD) },
+                libc::FD_CLOEXEC
+            );
+        }
+        let mut write = std::fs::File::from(write);
+        write.write_all(b"pipe").unwrap();
+        drop(write);
+        let mut contents = [0; 4];
+        std::fs::File::from(read).read_exact(&mut contents).unwrap();
+        assert_eq!(&contents, b"pipe");
+    }
 
     #[test]
     fn miri_test_str_to_ptr() {

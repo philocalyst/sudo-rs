@@ -482,11 +482,8 @@ mod test {
     use super::*;
 
     fn make_pipe() -> (File, File) {
-        // SAFETY: A valid pointer to a mutable array of 2 fds is passed in.
-        unsafe {
-            let [pipe0, pipe1] = crate::cutils::mkpipe().unwrap();
-            (File::from(pipe0), File::from(pipe1))
-        }
+        let [pipe0, pipe1] = crate::cutils::pipe().unwrap();
+        (File::from(pipe0), File::from(pipe1))
     }
 
     #[test]

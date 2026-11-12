@@ -130,7 +130,7 @@ pub(in crate::exec) fn exec_pty(
             dev_info!("stdin is not a terminal, creating a pipe");
             exec_bg = true;
 
-            let [p_in, p_out] = crate::cutils::mkpipe()?;
+            let [p_in, p_out] = crate::cutils::pipe()?;
             command.stdin(p_in);
             drop(p_out);
         } else {
