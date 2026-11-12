@@ -27,6 +27,7 @@ pub(crate) fn no_new_privs_enabled() -> io::Result<bool> {
 
 /// Temporary change privileges --- essentially a 'mini sudo'
 /// This is only used for sudoedit.
+#[cfg(any(test, target_os = "linux", target_os = "freebsd", target_os = "netbsd"))]
 pub(crate) fn sudo_call<T>(
     target_user: &User,
     target_group: &Group,
@@ -101,6 +102,15 @@ pub(crate) fn sudo_call<T>(
 
     std::mem::drop(guard);
     Ok(result)
+}
+
+#[cfg(all(not(test), target_os = "macos"))]
+pub(crate) fn sudo_call<T>(
+    target_user: &User,
+    target_group: &Group,
+    operation: impl FnOnce() -> T,
+) -> io::Result<T> {
+    super::group_credentials::with_identity(target_user, target_group.gid, operation)
 }
 
 #[cfg(feature = "unstable-remote-sudoers")]

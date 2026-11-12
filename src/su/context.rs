@@ -32,6 +32,7 @@ pub(crate) struct SuContext {
     pub(crate) user: User,
     pub(crate) requesting_user: CurrentUser,
     group: Group,
+    supplementary_groups: Option<Vec<crate::system::interface::GroupId>>,
 }
 
 /// check that a shell is not restricted / exists in /etc/shells
@@ -75,7 +76,7 @@ impl SuContext {
         let requesting_user = CurrentUser::resolve()?;
 
         // resolve target user
-        let mut user = User::from_name(options.user.as_cstr())?
+        let user = User::from_name(options.user.as_cstr())?
             .ok_or_else(|| Error::UserNotFound(options.user.clone().into()))?;
 
         // check the current user is root
@@ -92,9 +93,8 @@ impl SuContext {
         // resolve target group
         let mut group = user.primary_group()?;
 
-        if !options.supp_group.is_empty() || !options.group.is_empty() {
-            user.groups.clear();
-        }
+        let explicit_groups = !options.supp_group.is_empty() || !options.group.is_empty();
+        let mut groups = Vec::new();
 
         for group_name in options.group.iter() {
             let primary_group = Group::from_name(group_name.as_cstr())?
@@ -102,7 +102,7 @@ impl SuContext {
 
             // last argument is the primary group
             group = primary_group.clone();
-            user.groups.insert(0, primary_group.gid);
+            groups.insert(0, primary_group.gid);
         }
 
         // add additional group if current user is root
@@ -115,7 +115,7 @@ impl SuContext {
                 group = supp_group.clone();
             }
 
-            user.groups.push(supp_group.gid);
+            groups.push(supp_group.gid);
         }
 
         // the shell specified with --shell
@@ -191,6 +191,7 @@ impl SuContext {
             user,
             requesting_user,
             group,
+            supplementary_groups: explicit_groups.then_some(groups),
         })
     }
 }
@@ -205,6 +206,7 @@ impl SuContext {
             is_login: self.options.login,
             user: &self.user,
             group: &self.group,
+            supplementary_groups: self.supplementary_groups.as_deref(),
             umask: Umask::Preserve,
 
             background: false,

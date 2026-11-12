@@ -68,6 +68,7 @@ pub struct RunOptions<'a> {
     pub is_login: bool,
     pub user: &'a User,
     pub group: &'a Group,
+    pub supplementary_groups: Option<&'a [crate::system::interface::GroupId]>,
     pub umask: Umask,
 
     pub background: bool,
@@ -138,7 +139,12 @@ pub fn run_command(
         .clone();
 
     // set target user and groups
-    set_target_user(&mut command, options.user.clone(), options.group.clone());
+    set_target_user(
+        &mut command,
+        options.user.clone(),
+        options.group.clone(),
+        options.supplementary_groups,
+    );
 
     // change current directory if necessary.
     if let Some(path) = path {
