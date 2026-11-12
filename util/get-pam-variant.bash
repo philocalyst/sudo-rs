@@ -9,7 +9,7 @@ FreeBSD)
     echo openpam
     ;;
 *)
-    echo "Unsupported platform"
+    echo "Unsupported platform" >&2
     exit 1
     ;;
 esac
