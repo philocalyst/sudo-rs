@@ -362,7 +362,23 @@ fn faccess_at(parent: BorrowedFd, path: &CStr, mode: c_int, flags: c_int) -> io:
 // files by their name in the directory they were opened from.
 #[cfg(any(target_os = "netbsd", target_os = "macos"))]
 fn user_can_modify_at(parent: BorrowedFd, path: &CStr) -> io::Result<bool> {
+    #[cfg(target_os = "netbsd")]
     const RIGHTS: &[c_int] = &[libc::W_OK];
+    // W_OK only holds if all the rights needed to write are granted, which for a
+    // directory means both adding files and adding subdirectories; an access control
+    // list can grant either one, or the right to delete entries or the object. So ask
+    // about each right that changes the object, using the extended access bits from
+    // <sys/unistd.h>, each of which faccessat checks as exactly one right, see
+    // https://github.com/apple-oss-distributions/xnu/blob/xnu-11215.81.4/bsd/vfs/vfs_syscalls.c#L6621-L6643
+    #[cfg(target_os = "macos")]
+    const RIGHTS: &[c_int] = &[
+        1 << 10, // _WRITE_OK: write data, or add a file to a directory
+        1 << 12, // _DELETE_OK: delete it
+        1 << 13, // _APPEND_OK: append data, or add a subdirectory to a directory
+        1 << 14, // _RMFILE_OK: delete an entry from a directory
+        1 << 20, // _WPERM_OK: change the permissions, which can grant all of the above
+        1 << 21, // _CHOWN_OK: change the ownership
+    ];
     for &right in RIGHTS {
         if access_allowed(faccess_at(parent, path, right, libc::AT_SYMLINK_NOFOLLOW))? {
             return Ok(true);
@@ -563,6 +579,75 @@ mod test {
 
         let root = File::open("/").unwrap();
         assert!(!user_can_modify_at(root.as_fd(), c".").unwrap());
+    }
+
+    // A file its owner may only append to: W_OK says no, but the user can change it.
+    // (The owner may also change its permissions; a file owned by someone else cannot
+    // be set up without privileges.)
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn append_only_acl_counts_as_modifiable() {
+        use std::io::Write;
+        let dir = crate::system::file::create_temporary_dir().unwrap();
+        let path = dir.join("file");
+        fs::write(&path, "").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o400)).unwrap();
+        let append = || OpenOptions::new().append(true).open(&path)?.write_all(b"x");
+        let before = append();
+        let user = User::real().unwrap().unwrap();
+        let acl = std::process::Command::new("/bin/chmod")
+            .args(["+a", &format!("user:{} allow append", user.name)])
+            .arg(&path)
+            .status();
+        let dir_fd = File::open(&dir).unwrap();
+        let w_ok = faccess_at(
+            dir_fd.as_fd(),
+            c"file",
+            libc::W_OK,
+            libc::AT_SYMLINK_NOFOLLOW,
+        );
+        let modifiable = user_can_modify_at(dir_fd.as_fd(), c"file");
+        let after = append();
+        fs::remove_dir_all(&dir).unwrap();
+
+        assert_eq!(before.unwrap_err().raw_os_error(), Some(libc::EACCES));
+        assert!(acl.unwrap().success());
+        assert_eq!(w_ok.unwrap_err().raw_os_error(), Some(libc::EACCES));
+        after.unwrap();
+        assert!(modifiable.unwrap());
+    }
+
+    // Asking about "." sees a right granted on the directory itself, as the actual
+    // operation does: here the right to delete it.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn dot_query_sees_rights_on_the_directory() {
+        const DELETE: c_int = 1 << 12; // _DELETE_OK
+        let dir = crate::system::file::create_temporary_dir().unwrap();
+        let child = dir.join("child");
+        fs::create_dir(&child).unwrap();
+        let child_fd = File::open(&child).unwrap();
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o500)).unwrap();
+        fs::set_permissions(&child, fs::Permissions::from_mode(0o500)).unwrap();
+        let query = || faccess_at(child_fd.as_fd(), c".", DELETE, libc::AT_SYMLINK_NOFOLLOW);
+        let (asked_before, removed_before) = (query(), fs::remove_dir(&child));
+        let user = User::real().unwrap().unwrap();
+        let acl = std::process::Command::new("/bin/chmod")
+            .args(["+a", &format!("user:{} allow delete", user.name)])
+            .arg(&child)
+            .status();
+        let (asked_after, removed_after) = (query(), fs::remove_dir(&child));
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).unwrap();
+        fs::remove_dir_all(&dir).unwrap();
+
+        assert_eq!(asked_before.unwrap_err().raw_os_error(), Some(libc::EACCES));
+        assert_eq!(
+            removed_before.unwrap_err().raw_os_error(),
+            Some(libc::EACCES)
+        );
+        assert!(acl.unwrap().success());
+        asked_after.unwrap();
+        removed_after.unwrap();
     }
 
     #[test]
