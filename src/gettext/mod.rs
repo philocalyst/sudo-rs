@@ -1,3 +1,8 @@
+// macOS has no system libintl. Packaging a setuid binary with an external
+// translation library needs a trusted, root-owned installation prefix.
+#[cfg(all(feature = "gettext", target_os = "macos"))]
+compile_error!("gettext on macOS requires a supported system libintl installation");
+
 #[cfg(feature = "gettext")]
 use std::{
     ffi::{CStr, CString},
@@ -163,7 +168,7 @@ macro_rules! xlat_println {
 //These are all defined in POSIX.
 #[cfg(feature = "gettext")]
 mod gettext_sys {
-    #[cfg_attr(target_os = "freebsd", link(name = "intl"))]
+    #[cfg_attr(any(target_os = "freebsd", target_os = "netbsd"), link(name = "intl"))]
     unsafe extern "C" {
         pub fn dgettext(
             domain: *const libc::c_char,
