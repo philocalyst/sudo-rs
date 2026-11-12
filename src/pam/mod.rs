@@ -25,6 +25,8 @@ mod securemem;
     any(target_os = "freebsd", target_os = "macos", target_os = "netbsd"),
     path = "sys_openpam.rs"
 )]
+// Apple lacks the unused PAM_BAD_ITEM extension in these shared bindings.
+#[cfg_attr(target_os = "macos", allow(dead_code))]
 #[allow(nonstandard_style)]
 pub mod sys;
 

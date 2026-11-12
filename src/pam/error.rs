@@ -57,7 +57,8 @@ pub enum PamErrorType {
     TryAgain,
     ModuleUnknown,
     /// The application tried to set/delete an undefined or inaccessible item.
-    BadItem, // Extension in OpenPAM and LinuxPAM
+    #[cfg(any(target_os = "linux", target_os = "freebsd", target_os = "netbsd"))]
+    BadItem, // Not present in Apple OpenPAM.
     // DomainUnknown, // OpenPAM only
     // BadHandle // OpenPAM only
     // BadFeature // OpenPAM only
@@ -101,6 +102,7 @@ impl PamErrorType {
             PAM_ABORT => Abort,
             PAM_TRY_AGAIN => TryAgain,
             PAM_MODULE_UNKNOWN => ModuleUnknown,
+            #[cfg(any(target_os = "linux", target_os = "freebsd", target_os = "netbsd"))]
             PAM_BAD_ITEM => BadItem,
             // PAM_DOMAIN_UNKNOWN => DomainUnknown,
             // PAM_BAD_HANDLE => BadHandle,
@@ -145,6 +147,7 @@ impl PamErrorType {
             Abort => PAM_ABORT as c_int,
             TryAgain => PAM_TRY_AGAIN as c_int,
             ModuleUnknown => PAM_MODULE_UNKNOWN as c_int,
+            #[cfg(any(target_os = "linux", target_os = "freebsd", target_os = "netbsd"))]
             BadItem => PAM_BAD_ITEM as c_int,
             // DomainUnknown => PAM_DOMAIN_UNKNOWN as c_int,
             // BadHandle => PAM_BAD_HANDLE as c_int,
@@ -280,7 +283,36 @@ pub(super) fn pam_err(err: c_int) -> Result<(), PamError> {
 
 #[cfg(test)]
 mod test {
-    use super::PamErrorType;
+    use super::{PamError, PamErrorType, pam_err};
+
+    #[test]
+    fn only_zero_is_authentication_success() {
+        assert!(matches!(pam_err(0), Ok(())));
+        // Includes Apple account lockout and smart-card errors, unknown negative
+        // codes, and OpenPAM extensions which are absent on macOS.
+        for code in [-1, 1, 9, 29, 30, 31, 1024, 1025, 1026, 1027, i32::MAX] {
+            match pam_err(code) {
+                Err(PamError::Pam(error)) => {
+                    assert_ne!(error, PamErrorType::Success);
+                    assert_eq!(error.as_int(), code);
+                }
+                result => panic!("PAM status {code} was not preserved: {result:?}"),
+            }
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn apple_undefined_and_extension_errors_remain_unknown() {
+        // Apple SDK security/pam_constants.h defines standard errors 0..=29
+        // and extensions beginning at 1024; it does not define PAM_BAD_ITEM.
+        for code in [31, 1024, 1025, 1026, 1027] {
+            assert_eq!(
+                PamErrorType::from_int(code),
+                PamErrorType::UnknownErrorType(code)
+            );
+        }
+    }
 
     #[test]
     fn isomorphy() {
