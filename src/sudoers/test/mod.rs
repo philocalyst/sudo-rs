@@ -423,6 +423,107 @@ fn default_set_test() {
 }
 
 #[test]
+fn lecture_file_has_the_syntax_of_original_sudo() {
+    // original sudo declares lecture_file as a path that can be negated
+    // (T_STR|T_PATH|T_BOOL in plugins/sudoers/def_data.in)
+    for line in [
+        "Defaults lecture_file = \"/etc/sudo_lecture\"",
+        "Defaults lecture_file=/etc/sudo_lecture",
+        "Defaults:user lecture_file = /etc/sudo_lecture",
+        "Defaults !lecture_file",
+    ] {
+        assert!(parse_line(line).is_decl(), "{line}");
+    }
+
+    // original sudo also rejects these, as "no value specified" and "invalid operator"
+    for (line, expected) in [
+        (
+            "Defaults lecture_file",
+            "'lecture_file' is not a boolean setting",
+        ),
+        (
+            "Defaults lecture_file += /etc/sudo_lecture",
+            "lecture_file is not a list parameter",
+        ),
+    ] {
+        let [Err(Status::Fatal(_, message)), ..] =
+            &parse_lines::<Sudo>(&mut CharStream::new(line))[..]
+        else {
+            panic!("{line} was accepted");
+        };
+        assert_eq!(message, expected);
+    }
+}
+
+#[test]
+fn macos_stock_sudoers_parses_without_diagnostics() {
+    // The non-comment lines of the /etc/sudoers that macOS installs, from
+    // https://github.com/apple-oss-distributions/sudo/blob/sudo-114.100.11/files/sudoers
+    // (the file is the same in sudo-113 and sudo-114.0.2). Its last line,
+    // `#includedir /private/etc/sudoers.d`, is checked on its own below, since
+    // reading that directory would make this test depend on the host.
+    let stock = concat!(
+        "Defaults\tenv_reset\n",
+        "Defaults\tenv_keep += \"BLOCKSIZE\"\n",
+        "Defaults\tenv_keep += \"COLORFGBG COLORTERM\"\n",
+        "Defaults\tenv_keep += \"__CF_USER_TEXT_ENCODING\"\n",
+        "Defaults\tenv_keep += \"CHARSET LANG LANGUAGE LC_ALL LC_COLLATE LC_CTYPE\"\n",
+        "Defaults\tenv_keep += \"LC_MESSAGES LC_MONETARY LC_NUMERIC LC_TIME\"\n",
+        "Defaults\tenv_keep += \"LINES COLUMNS\"\n",
+        "Defaults\tenv_keep += \"LSCOLORS\"\n",
+        "Defaults\tenv_keep += \"SSH_AUTH_SOCK\"\n",
+        "Defaults\tenv_keep += \"TZ\"\n",
+        "Defaults\tenv_keep += \"DISPLAY XAUTHORIZATION XAUTHORITY\"\n",
+        "Defaults\tenv_keep += \"EDITOR VISUAL\"\n",
+        "Defaults\tenv_keep += \"HOME MAIL\"\n",
+        "Defaults\tlecture_file = \"/etc/sudo_lecture\"\n",
+        "Defaults\t!log_allowed\n",
+        "root\t\tALL = (ALL) ALL\n",
+        "%admin\t\tALL = (ALL) ALL\n",
+    );
+
+    // Sudoers::read is the path visudo takes; sudo takes the same one after opening the file
+    let read = || Sudoers::read(stock.as_bytes(), "/etc/sudoers").unwrap();
+    let judge = |user: &'static str| {
+        let (mut sudoers, _) = read();
+        let request = Request {
+            user: &Named("root"),
+            group: &Named("root"),
+            command: Path::new("/bin/ls"),
+            arguments: &[],
+        };
+        sudoers.check(&Named(user), &system::Hostname::fake("mac"), request)
+    };
+
+    // First show that the file was read at all: the rules and the settings on
+    // either side of lecture_file are in effect.
+    let admin = judge("admin");
+    assert_eq!(
+        admin.flags.as_ref().map(|tag| tag.authenticate),
+        Some(Authenticate::None)
+    );
+    assert!(
+        admin
+            .settings
+            .env_keep()
+            .contains("__CF_USER_TEXT_ENCODING")
+    );
+    assert!(!admin.settings.log_allowed());
+    assert_eq!(judge("staff").flags, None);
+
+    // Then that no line produced a diagnostic, which sudo would print on every run
+    // and which makes visudo reject the file.
+    let (_, diagnostics) = read();
+    let diagnostics: Vec<_> = diagnostics
+        .iter()
+        .map(|error| (error.location, error.message.as_str()))
+        .collect();
+    assert!(diagnostics.is_empty(), "{diagnostics:?}");
+
+    assert!(parse_line("#includedir /private/etc/sudoers.d").is_include_dir());
+}
+
+#[test]
 fn default_multi_test() {
     let (mut sudoers, _) = analyze(
         Path::new("/etc/fakesudoers"),
