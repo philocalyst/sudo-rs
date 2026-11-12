@@ -362,7 +362,32 @@ fn faccess_at(parent: BorrowedFd, path: &CStr, mode: c_int, flags: c_int) -> io:
 // Final files are queried relative to the already checked, non-writable parent.
 #[cfg(any(target_os = "netbsd", target_os = "macos"))]
 fn user_can_modify_at(parent: BorrowedFd, path: &CStr) -> io::Result<bool> {
-    match faccess_at(parent, path, libc::W_OK, libc::AT_SYMLINK_NOFOLLOW) {
+    #[cfg(target_os = "netbsd")]
+    const RIGHTS: &[c_int] = &[libc::W_OK];
+    // Darwin W_OK combines add_file and add_subdirectory for a directory;
+    // an ACL may grant just one. Ask separately for each modification right.
+    // Public sys/unistd.h values, translated by access1 in:
+    // https://github.com/apple-oss-distributions/xnu/blob/xnu-11215.81.4/bsd/vfs/vfs_syscalls.c
+    #[cfg(target_os = "macos")]
+    const RIGHTS: &[c_int] = &[
+        1 << 10, // _WRITE_OK: write data / add file
+        1 << 12, // _DELETE_OK: delete this object
+        1 << 13, // _APPEND_OK: append data / add subdirectory
+        1 << 14, // _RMFILE_OK: delete child
+        1 << 20, // _WPERM_OK: change permissions
+        1 << 21, // _CHOWN_OK: change ownership
+    ];
+    for &right in RIGHTS {
+        if access_allowed(faccess_at(parent, path, right, libc::AT_SYMLINK_NOFOLLOW))? {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+#[cfg(any(target_os = "netbsd", target_os = "macos"))]
+fn access_allowed(result: io::Result<()>) -> io::Result<bool> {
+    match result {
         Ok(()) => Ok(true),
         Err(error)
             if matches!(
@@ -514,6 +539,196 @@ fn traversed_secure_open(
 #[cfg(test)]
 mod test {
     use super::*;
+
+    #[cfg(any(target_os = "netbsd", target_os = "macos"))]
+    #[test]
+    fn access_errors_do_not_become_permission_denials() {
+        assert!(access_allowed(Ok(())).unwrap());
+        for code in [libc::EACCES, libc::EPERM, libc::EROFS] {
+            assert!(!access_allowed(Err(Error::from_raw_os_error(code))).unwrap());
+        }
+        for code in [libc::ENOENT, libc::EBADF, libc::EINVAL, libc::EIO] {
+            assert_eq!(
+                access_allowed(Err(Error::from_raw_os_error(code)))
+                    .unwrap_err()
+                    .raw_os_error(),
+                Some(code)
+            );
+        }
+        let root = File::open("/").unwrap();
+        // A missing component is an operational error, never proof of safety.
+        assert_eq!(
+            user_can_modify_at(root.as_fd(), c"/dev/null/not-a-directory")
+                .unwrap_err()
+                .raw_os_error(),
+            Some(libc::ENOTDIR)
+        );
+    }
+
+    #[cfg(any(target_os = "netbsd", target_os = "macos"))]
+    #[test]
+    fn kernel_access_check_observes_mode_changes() {
+        let mut path = std::env::temp_dir();
+        path.push(format!(
+            "sudo-rs-access-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        struct Cleanup(std::path::PathBuf);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                let _ = fs::remove_file(&self.0);
+            }
+        }
+        let file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&path)
+            .unwrap();
+        let _cleanup = Cleanup(path.clone());
+        let name = CString::new(path.as_os_str().as_bytes()).unwrap();
+        let parent = File::open("/").unwrap();
+        assert!(access_allowed(faccess_at(parent.as_fd(), &name, libc::W_OK, 0)).unwrap());
+        file.set_permissions(fs::Permissions::from_mode(0o400))
+            .unwrap();
+        assert_eq!(
+            faccess_at(parent.as_fd(), &name, libc::W_OK, 0)
+                .unwrap_err()
+                .raw_os_error(),
+            Some(libc::EACCES)
+        );
+        // The query is descriptor-relative for directories and does not need AT_EMPTY_PATH.
+        assert!(
+            user_can_modify_at(File::open(path.parent().unwrap()).unwrap().as_fd(), c".").unwrap()
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn darwin_append_acl_is_not_equivalent_to_write_access() {
+        let path = std::env::temp_dir().join(format!(
+            "sudo-rs-acl-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        struct Cleanup(std::path::PathBuf);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                let _ = fs::remove_file(&self.0);
+            }
+        }
+        let file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o400)
+            .open(&path)
+            .unwrap();
+        let _cleanup = Cleanup(path.clone());
+        let parent = File::open(path.parent().unwrap()).unwrap();
+        let name = CString::new(path.file_name().unwrap().as_bytes()).unwrap();
+        assert_eq!(
+            faccess_at(parent.as_fd(), &name, libc::W_OK, 0)
+                .unwrap_err()
+                .raw_os_error(),
+            Some(libc::EACCES)
+        );
+        assert_eq!(
+            OpenOptions::new()
+                .append(true)
+                .open(&path)
+                .unwrap_err()
+                .raw_os_error(),
+            Some(libc::EACCES)
+        );
+        let user = User::from_uid(UserId::new(file.metadata().unwrap().uid()))
+            .unwrap()
+            .unwrap();
+        let acl = format!("user:{} allow append", user.name);
+        assert!(
+            std::process::Command::new("/bin/chmod")
+                .args(["+a", &acl])
+                .arg(&path)
+                .status()
+                .unwrap()
+                .success()
+        );
+        // A normal W_OK query still denies, but the kernel permits append.
+        assert_eq!(
+            faccess_at(parent.as_fd(), &name, libc::W_OK, 0)
+                .unwrap_err()
+                .raw_os_error(),
+            Some(libc::EACCES)
+        );
+        assert!(user_can_modify_at(parent.as_fd(), &name).unwrap());
+        use std::io::Write;
+        OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap()
+            .write_all(b"append")
+            .unwrap();
+        assert_eq!(fs::read(&path).unwrap(), b"append");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn darwin_dot_query_observes_directory_delete_acl() {
+        let path = std::env::temp_dir().join(format!(
+            "sudo-rs-delete-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir(&path).unwrap();
+        struct Cleanup(std::path::PathBuf);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                let _ = fs::set_permissions(&self.0, fs::Permissions::from_mode(0o700));
+                let _ = fs::remove_dir_all(&self.0);
+            }
+        }
+        let _cleanup = Cleanup(path.clone());
+        let child = path.join("child");
+        fs::create_dir(&child).unwrap();
+        let dir = File::open(&child).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o500)).unwrap();
+        fs::set_permissions(&child, fs::Permissions::from_mode(0o500)).unwrap();
+        const DELETE: c_int = 1 << 12;
+        assert_eq!(
+            faccess_at(dir.as_fd(), c".", DELETE, libc::AT_SYMLINK_NOFOLLOW)
+                .unwrap_err()
+                .raw_os_error(),
+            Some(libc::EACCES)
+        );
+        assert_eq!(
+            fs::remove_dir(&child).unwrap_err().raw_os_error(),
+            Some(libc::EACCES)
+        );
+        let user = User::real().unwrap().unwrap();
+        let acl = format!("user:{} allow delete", user.name);
+        assert!(
+            std::process::Command::new("/bin/chmod")
+                .args(["+a", &acl])
+                .arg(&child)
+                .status()
+                .unwrap()
+                .success()
+        );
+        // Deleting is granted on the object even though its parent is not writable.
+        // The descriptor-relative dot query must observe that object ACL.
+        faccess_at(dir.as_fd(), c".", DELETE, libc::AT_SYMLINK_NOFOLLOW).unwrap();
+        fs::remove_dir(&child).unwrap();
+        assert!(!child.exists());
+    }
 
     #[test]
     fn secure_open_is_predictable() {
