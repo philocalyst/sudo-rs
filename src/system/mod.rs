@@ -300,14 +300,26 @@ fn set_supplementary_groups(groups: &[GroupId]) -> io::Result<()> {
 
     // Outside of Linux, setgroups expects the size to be passed as a c_int, so the below
     // conversion protects a very extreme case of arithmetic conversion error
+    #[cfg(any(target_os = "linux", target_os = "freebsd"))]
     #[allow(clippy::useless_conversion)]
     let len = std::cmp::min(groups.len().try_into().unwrap_or(NGROUPS_MAX), NGROUPS_MAX);
+    #[cfg(any(target_os = "netbsd", target_os = "macos"))]
+    let len = checked_group_count(groups.len(), NGROUPS_MAX as usize)?;
 
     // SAFETY: setgroups is passed a valid pointer to a chunk of memory of the correct size
     // We can cast to gid_t because `GroupId` is marked as transparent
     cerr(unsafe { libc::setgroups(len, groups.as_ptr().cast::<libc::gid_t>()) })?;
 
     Ok(())
+}
+
+#[cfg(any(target_os = "netbsd", target_os = "macos"))]
+fn checked_group_count(count: usize, limit: usize) -> io::Result<c_int> {
+    // Dropping a group can grant access through the file's other permission class.
+    if count > limit {
+        return Err(io::Error::from_raw_os_error(libc::EINVAL));
+    }
+    c_int::try_from(count).map_err(|_| io::Error::from_raw_os_error(libc::EINVAL))
 }
 
 /// set target user and groups (uid, gid, additional groups) for a command
@@ -1090,6 +1102,35 @@ mod tests {
         test("dr. bill", "fidelio", 1999, &["eyes", "wide", "shut"]);
         test("eris", "fnord", 5, &[]);
         test("abc", "password123", 42, &[""]);
+    }
+
+    #[cfg(any(target_os = "netbsd", target_os = "macos"))]
+    #[test]
+    fn explicit_group_lists_are_never_silently_shortened() {
+        for n in [0, 15, 16] {
+            assert_eq!(super::checked_group_count(n, 16).unwrap(), n as i32);
+        }
+        for n in [17, usize::MAX] {
+            assert_eq!(
+                super::checked_group_count(n, 16)
+                    .unwrap_err()
+                    .raw_os_error(),
+                Some(libc::EINVAL)
+            );
+        }
+        let primary = GroupId::new(99);
+        for mut groups in [
+            vec![],
+            vec![primary],
+            vec![GroupId::new(1), primary, primary],
+        ] {
+            let original = groups.clone();
+            super::inject_group(primary, &mut groups);
+            assert_eq!(groups[0], primary);
+            for group in original {
+                assert!(groups.contains(&group));
+            }
+        }
     }
 
     #[test]
