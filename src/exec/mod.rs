@@ -348,3 +348,62 @@ const fn cond_fmt<'a>(cond: bool, true_s: &'a str, false_s: &'a str) -> &'a str 
 const fn opt_fmt(cond: bool, s: &str) -> &str {
     cond_fmt(cond, s, "")
 }
+
+#[cfg(all(test, not(target_os = "linux")))]
+mod tests {
+    use super::*;
+
+    const REFUSAL: &str = "NOEXEC is currently only supported on Linux";
+
+    // With --background, run_command ends its caller with exit(0) after forking, so it must
+    // not run in the test runner itself. A fresh copy of the test binary is used instead of a
+    // forked copy of the multithreaded runner, which may only make async-signal-safe calls.
+    fn check_refusal(background: bool) -> ! {
+        // SAFETY: alarm has no memory-safety requirements. This process runs only this test.
+        unsafe { libc::alarm(10) };
+        let user = User::real().unwrap().unwrap();
+        let group = user.primary_group().unwrap();
+        let options = RunOptions {
+            command: Path::new("/usr/bin/true"),
+            arguments: &[],
+            arg0: None,
+            chdir: None,
+            is_login: false,
+            user: &user,
+            group: &group,
+            umask: Umask::Preserve,
+            background,
+            use_pty: false,
+            noexec: true,
+        };
+
+        let error = run_command(options, std::iter::empty::<(&str, &str)>()).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::Other);
+        assert_eq!(error.to_string(), REFUSAL);
+        _exit(42)
+    }
+
+    #[test]
+    fn unsupported_noexec_is_refused_before_backgrounding() {
+        const CHILD_MODE: &str = "SUDO_RS_TEST_UNSUPPORTED_NOEXEC";
+        if let Ok(mode) = std::env::var(CHILD_MODE) {
+            check_refusal(mode == "background");
+        }
+
+        for mode in ["foreground", "background"] {
+            let status = Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "exec::tests::unsupported_noexec_is_refused_before_backgrounding",
+                    "--nocapture",
+                ])
+                .env(CHILD_MODE, mode)
+                .status()
+                .unwrap();
+            // This is the status of the process that called run_command. Without the early
+            // refusal it exits 0 when forking for --background, and only the detached child
+            // sees the error. A test filter that matches nothing would also exit 0.
+            assert_eq!(status.code(), Some(42), "{mode}: refusal missed the caller");
+        }
+    }
+}
