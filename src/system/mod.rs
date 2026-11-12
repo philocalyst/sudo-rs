@@ -797,9 +797,19 @@ impl Process {
                 )
             }) {
                 Ok(_) => {
-                    assert!(size >= size_of::<KinfoProc>());
+                    // NetBSD answers with no record for a process that does not exist
+                    // (or that it hides), where FreeBSD fails with ESRCH.
+                    if size == 0 {
+                        return Err(io::Error::from_raw_os_error(libc::ESRCH));
+                    }
+                    if size < size_of::<KinfoProc>() {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "incomplete process information",
+                        ));
+                    }
                     // SAFETY: The above sysctl has initialized at least `size` bytes. We have
-                    // asserted that this is at least a single element.
+                    // checked that this is at least a single element.
                     unsafe {
                         ki_proc.set_len(1);
                     }
@@ -813,7 +823,14 @@ impl Process {
             }
         }
 
-        Ok(ki_proc[0])
+        let info = ki_proc[0];
+        // NetBSD leaves the start time of a zombie out, and zero is not an identity.
+        // https://github.com/NetBSD/src/blob/netbsd-10/sys/kern/kern_proc.c#L2918-L2921
+        #[cfg(target_os = "netbsd")]
+        if info.p_uvalid == 0 {
+            return Err(io::Error::from_raw_os_error(libc::ESRCH));
+        }
+        Ok(info)
     }
 
     /// Returns the device identifier of the TTY device that is currently
@@ -824,13 +841,16 @@ impl Process {
 
         #[cfg(target_os = "freebsd")]
         let dev_nr = ki_proc.ki_tdev;
+        // NetBSD exports the device, and NODEV, as a 32-bit value.
+        // https://github.com/NetBSD/src/blob/netbsd-10/sys/kern/kern_proc.c#L2909-L2914
         #[cfg(target_os = "netbsd")]
-        let dev_nr = ki_proc.p_tdev.into();
+        let dev_nr = ki_proc.p_tdev;
 
         if dev_nr == !0 {
             Ok(None)
         } else {
-            Ok(Some(DeviceId::new(dev_nr)))
+            #[allow(clippy::useless_conversion)] // u64 on FreeBSD, u32 on NetBSD
+            Ok(Some(DeviceId::new(dev_nr.into())))
         }
     }
 
@@ -1087,6 +1107,24 @@ mod tests {
         test("dr. bill", "fidelio", 1999, &["eyes", "wide", "shut"]);
         test("eris", "fnord", 5, &[]);
         test("abc", "password123", 42, &[""]);
+    }
+
+    // macOS still answers with stubs here
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn process_queries_reject_a_missing_pid() {
+        // no system hands out this pid
+        let missing = || WithProcess::Other(ProcessId::new(i32::MAX));
+        // Linux has no procfs entry for it; the BSDs report ESRCH
+        let errno = if cfg!(target_os = "linux") {
+            libc::ENOENT
+        } else {
+            libc::ESRCH
+        };
+        let tty = super::Process::tty_device_id(missing());
+        assert_eq!(tty.unwrap_err().raw_os_error(), Some(errno));
+        let start = super::Process::starting_time(missing());
+        assert_eq!(start.unwrap_err().raw_os_error(), Some(errno));
     }
 
     #[test]
