@@ -190,6 +190,15 @@ mod test {
     use super::{dynamic_fill, os_string_from_ptr, string_from_ptr};
 
     #[test]
+    fn pipe_ends_are_close_on_exec() {
+        use std::os::fd::AsRawFd;
+        for end in super::mkpipe().unwrap() {
+            let flags = unsafe { libc::fcntl(end.as_raw_fd(), libc::F_GETFD) };
+            assert_eq!(flags, libc::FD_CLOEXEC);
+        }
+    }
+
+    #[test]
     fn miri_test_str_to_ptr() {
         let strp = |ptr| unsafe { string_from_ptr(ptr) };
         assert_eq!(strp(std::ptr::null()), "");
