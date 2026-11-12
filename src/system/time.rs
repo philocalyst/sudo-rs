@@ -106,7 +106,7 @@ impl From<libc::timespec> for SystemTime {
     }
 }
 
-/// A timestamp relative to `CLOCK_BOOTTIME` on Linux and relative to `CLOCK_REALTIME` on FreeBSD.
+/// A process start timestamp: boot-relative on Linux, wall-clock on BSD and macOS.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub struct ProcessCreateTime {
     secs: i64,
@@ -134,10 +134,10 @@ impl ProcessCreateTime {
         let mut spec = MaybeUninit::<libc::timespec>::uninit();
         // SAFETY: valid pointer is passed to clock_gettime
         crate::cutils::cerr(unsafe {
-            #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+            #[cfg(target_os = "linux")]
             let clock_source = libc::CLOCK_BOOTTIME;
-            #[cfg(any(target_os = "macos", target_os = "netbsd"))]
-            let clock_source = libc::CLOCK_MONOTONIC;
+            #[cfg(any(target_os = "freebsd", target_os = "macos", target_os = "netbsd"))]
+            let clock_source = libc::CLOCK_REALTIME;
             libc::clock_gettime(clock_source, spec.as_mut_ptr())
         })?;
         // SAFETY: The `libc::clock_gettime` will correctly initialize `spec`,
