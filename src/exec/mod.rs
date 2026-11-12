@@ -348,3 +348,60 @@ const fn cond_fmt<'a>(cond: bool, true_s: &'a str, false_s: &'a str) -> &'a str 
 const fn opt_fmt(cond: bool, s: &str) -> &str {
     cond_fmt(cond, s, "")
 }
+
+#[cfg(all(test, not(target_os = "linux")))]
+mod tests {
+    use super::*;
+    use crate::system::fork_for_test;
+
+    const REFUSAL: &str = "NOEXEC is currently only supported on Linux";
+
+    /// Calls `run_command` with NOEXEC, which this platform cannot enforce, in a child process
+    /// that stands in for the sudo started by the user. Returns the exit status of that child:
+    /// 42 if `run_command` returned the refusal to it.
+    fn exit_status_of_invoking_sudo(background: bool) -> Option<i32> {
+        let user = User::real().unwrap().unwrap();
+        let group = user.primary_group().unwrap();
+        let options = RunOptions {
+            command: Path::new("/usr/bin/true"),
+            arguments: &[],
+            arg0: None,
+            chdir: None,
+            is_login: false,
+            user: &user,
+            group: &group,
+            umask: Umask::Preserve,
+            background,
+            use_pty: false,
+            noexec: true,
+        };
+
+        // SAFETY: Not really safe, but this is test only code.
+        let invoking_sudo = unsafe {
+            fork_for_test(|| {
+                let result = run_command(options, std::iter::empty::<(&str, &str)>());
+                match result {
+                    Err(err) if err.to_string() == REFUSAL => _exit(42),
+                    _ => _exit(1),
+                }
+            })
+        };
+        let (_, status) = invoking_sudo.wait(WaitOptions::new()).unwrap();
+        status.exit_status()
+    }
+
+    #[test]
+    fn unsupported_noexec_is_refused_before_backgrounding() {
+        // Without `-b`, the refusal reaches the process that called run_command.
+        assert_eq!(exit_status_of_invoking_sudo(false), Some(42));
+
+        // With `-b` it must as well. If run_command forked first, the invoking sudo exits with
+        // status 0 inside run_command, and only the detached process, whose exit status nobody
+        // sees, is refused.
+        assert_eq!(
+            exit_status_of_invoking_sudo(true),
+            Some(42),
+            "the refusal did not reach the invoking sudo"
+        );
+    }
+}
