@@ -858,7 +858,9 @@ impl Process {
     /// attached to the given process
     #[cfg(target_os = "macos")]
     pub fn tty_device_id(pid: WithProcess) -> std::io::Result<Option<DeviceId>> {
-        Ok(None)
+        let info = Self::get_proc_info(pid)?;
+        // e_tdev is NODEV, i.e. -1, as a u32 when there is no controlling terminal
+        Ok((info.e_tdev != u32::MAX).then(|| DeviceId::new(info.e_tdev as libc::dev_t)))
     }
 
     /// Get the process starting time of a specific process
@@ -903,7 +905,57 @@ impl Process {
     /// Get the process starting time of a specific process
     #[cfg(target_os = "macos")]
     pub fn starting_time(pid: WithProcess) -> io::Result<ProcessCreateTime> {
-        Ok(ProcessCreateTime::new(0, 0))
+        let info = Self::get_proc_info(pid)?;
+        let secs = i64::try_from(info.pbi_start_tvsec)
+            .map_err(|_| io::Error::from(io::ErrorKind::InvalidData))?;
+        if info.pbi_start_tvusec >= 1_000_000 {
+            return Err(io::ErrorKind::InvalidData.into());
+        }
+        // This is wall-clock time, so no process started at 0. Do not let a missing
+        // start time pass for an identity that timestamp records could be keyed to.
+        if secs == 0 && info.pbi_start_tvusec == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "missing process start time",
+            ));
+        }
+        Ok(ProcessCreateTime::new(
+            secs,
+            info.pbi_start_tvusec as i64 * 1000,
+        ))
+    }
+
+    #[cfg(target_os = "macos")]
+    fn get_proc_info(pid: WithProcess) -> io::Result<libc::proc_bsdinfo> {
+        let pid = match pid {
+            WithProcess::Current => Self::process_id().inner(),
+            WithProcess::Other(pid) => pid.inner(),
+        };
+        let mut info = MaybeUninit::<libc::proc_bsdinfo>::uninit();
+        // proc_pidinfo answers with the wall-clock start time and the terminal device
+        // https://github.com/apple-oss-distributions/xnu/blob/xnu-11215.81.4/bsd/kern/proc_info.c
+        // SAFETY: info points to a buffer of the advertised size.
+        let size = unsafe {
+            libc::proc_pidinfo(
+                pid,
+                libc::PROC_PIDTBSDINFO,
+                0,
+                info.as_mut_ptr().cast(),
+                size_of::<libc::proc_bsdinfo>() as i32,
+            )
+        };
+        // proc_pidinfo reports failure as 0 with errno set, not as -1
+        if size <= 0 {
+            return Err(io::Error::last_os_error());
+        }
+        if size as usize != size_of::<libc::proc_bsdinfo>() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "incomplete process information",
+            ));
+        }
+        // SAFETY: proc_pidinfo returned exactly one fully initialized record.
+        Ok(unsafe { info.assume_init() })
     }
 }
 
@@ -1109,8 +1161,6 @@ mod tests {
         test("abc", "password123", 42, &[""]);
     }
 
-    // macOS still answers with stubs here
-    #[cfg(not(target_os = "macos"))]
     #[test]
     fn process_queries_reject_a_missing_pid() {
         // no system hands out this pid
@@ -1128,8 +1178,82 @@ mod tests {
     }
 
     #[test]
-    fn get_process_tty_device() {
-        assert!(super::Process::tty_device_id(WithProcess::Current).is_ok());
+    fn process_queries_identify_the_controlling_terminal() {
+        const CHILD: &str = "SUDO_RS_TEST_CONTROLLING_TERMINAL";
+        if std::env::var_os(CHILD).is_some() {
+            check_controlling_terminal();
+        }
+
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "system::tests::process_queries_identify_the_controlling_terminal",
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .spawn()
+            .unwrap();
+        // The child's alarm only starts once it runs, so bound the wait here too.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        let status = loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                break status;
+            }
+            if std::time::Instant::now() > deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("the test process did not exit within 60 seconds");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        };
+        // Only a child that passed every check exits with 42; a test filter
+        // that matches nothing would exit 0.
+        assert_eq!(
+            status.code(),
+            Some(42),
+            "the test process failed, see above"
+        );
+    }
+
+    // This starts a session and takes a controlling terminal, so it runs in a fresh
+    // copy of the test binary, not in the test runner or a forked copy of it.
+    fn check_controlling_terminal() -> ! {
+        use crate::system::term::{Pty, Terminal};
+        use std::os::unix::{ffi::OsStrExt, fs::MetadataExt};
+
+        unsafe { libc::alarm(10) };
+
+        let pty = Pty::open().unwrap();
+        let path = std::ffi::OsStr::from_bytes(pty.path.as_bytes());
+        let rdev = std::fs::metadata(path).unwrap().rdev();
+        let parent = ProcessId::new(unsafe { libc::getppid() });
+        let this = || WithProcess::Other(super::Process::process_id());
+
+        // a new session has no controlling terminal yet
+        super::setsid().unwrap();
+        assert_eq!(
+            super::Process::tty_device_id(WithProcess::Current).unwrap(),
+            None
+        );
+
+        pty.follower.make_controlling_terminal().unwrap();
+        let tty = super::Process::tty_device_id(WithProcess::Current)
+            .unwrap()
+            .unwrap();
+        // rdev widens a signed 32-bit dev_t on macOS the same way
+        #[allow(clippy::unnecessary_cast)]
+        let reported = tty.inner() as u64;
+        assert_eq!(reported, rdev);
+        assert_eq!(super::Process::tty_device_id(this()).unwrap(), Some(tty));
+
+        // this process started after the test runner that spawned it, and before
+        // now on the clock that process start times use
+        let start = super::Process::starting_time(WithProcess::Current).unwrap();
+        assert_eq!(super::Process::starting_time(this()).unwrap(), start);
+        let parent_start = super::Process::starting_time(WithProcess::Other(parent)).unwrap();
+        assert!(parent_start <= start);
+        assert!(start <= super::ProcessCreateTime::now().unwrap());
+        super::_exit(42)
     }
 
     #[test]

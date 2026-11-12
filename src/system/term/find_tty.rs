@@ -25,8 +25,8 @@ pub(super) fn ttyname_from_dev() -> io::Result<Option<OsString>> {
 }
 
 fn is_our_tty(metadata: fs::Metadata, tty_dev: DeviceId) -> bool {
-    // On MacOS, `dev_t` is a sign-extended 32-bit value stored in 64-bits
-    // again recovers the original device number on every platform.
+    // On macOS dev_t is signed i32; Metadata::rdev sign-extends it to u64.
+    // Widen the signed device identifier in the same way before comparing.
     metadata.file_type().is_char_device() && metadata.rdev() == tty_dev.inner() as _
 }
 
