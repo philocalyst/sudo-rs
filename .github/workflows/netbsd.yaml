@@ -1,0 +1,76 @@
+name: NetBSD
+
+permissions: {}
+
+on:
+  push:
+  pull_request:
+  merge_group:
+
+jobs:
+  netbsd:
+    name: NetBSD unit tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Unit tests in a NetBSD VM
+        uses: vmactions/netbsd-vm@5957cf330aef2e6ddc63c604364c99ce2e02b91d # v1.5.3
+        with:
+          release: '10.2'
+          arch: x86_64
+          sync-time: true
+          cache-after-prepare: true
+          prepare: |
+            set -eu
+            /usr/sbin/pkg_add rust git-base
+          run: |
+            set -eu
+            export PATH=/usr/pkg/bin:/usr/pkg/sbin:/usr/bin:/bin:/usr/sbin:/sbin
+            uname -a
+            rustc --version
+            cargo --version
+            mount
+            useradd -m sudorstest
+            chown -R sudorstest .
+            # Unit tests deliberately exercise the unprivileged caller paths.
+            su -m sudorstest -c "cd '$PWD' && env HOME=/home/sudorstest cargo test --lib --release"
+            # P6 adds this check; it needs no bindgen installation.
+            if test -f util/check-pam-abi.sh; then
+              su -m sudorstest -c "cd '$PWD' && sh util/check-pam-abi.sh"
+            fi
+
+  clippy:
+    name: NetBSD cross-target clippy
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: rustup target add x86_64-unknown-netbsd
+      - run: cargo clippy --all-targets --target x86_64-unknown-netbsd -- --deny warnings
+      - run: cargo check --all-targets --target x86_64-unknown-netbsd --features pam-login,unstable-remote-sudoers,gettext
+
+  native:
+    # Enable only after P9 and its disposable-host setup have been reviewed.
+    if: ${{ false }}
+    name: NetBSD privileged native tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: vmactions/netbsd-vm@5957cf330aef2e6ddc63c604364c99ce2e02b91d # v1.5.3
+        with:
+          release: '10.2'
+          arch: x86_64
+          sync-time: true
+          prepare: /usr/sbin/pkg_add rust git-base sudo
+          run: |
+            set -eu
+            export PATH=/usr/pkg/bin:/usr/pkg/sbin:/usr/bin:/bin:/usr/sbin:/sbin
+            sh test-framework/native-tests/run.sh --disposable
