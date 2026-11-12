@@ -83,6 +83,15 @@ pub fn run_command(
     options: RunOptions<'_>,
     env: impl IntoIterator<Item = (impl AsRef<OsStr>, impl AsRef<OsStr>)>,
 ) -> io::Result<ExitReason> {
+    // Refuse before forking for `-b`, so that the invoking sudo, not the detached one, reports
+    // the error.
+    #[cfg(not(target_os = "linux"))]
+    if options.noexec {
+        return Err(io::Error::other(
+            "NOEXEC is currently only supported on Linux",
+        ));
+    }
+
     if options.background {
         // SAFETY: There should be no other threads at this point.
         match unsafe { fork() }? {
@@ -117,17 +126,15 @@ pub fn run_command(
         command.arg0(OsStr::from_bytes(&process_name));
     }
 
+    #[cfg(target_os = "linux")]
     let spawn_noexec_handler = if options.noexec {
-        #[cfg(not(target_os = "linux"))]
-        return Err(io::Error::other(
-            "NOEXEC is currently only supported on Linux",
-        ));
-
-        #[cfg(target_os = "linux")]
         Some(noexec::add_noexec_filter(&mut command)?)
     } else {
         None
     };
+    // NOEXEC was refused at the start of this function.
+    #[cfg(not(target_os = "linux"))]
+    let spawn_noexec_handler = None;
 
     // Decide if the pwd should be changed. `--chdir` takes precedence over `-i`.
     let path = options
@@ -347,4 +354,76 @@ const fn cond_fmt<'a>(cond: bool, true_s: &'a str, false_s: &'a str) -> &'a str 
 
 const fn opt_fmt(cond: bool, s: &str) -> &str {
     cond_fmt(cond, s, "")
+}
+
+#[cfg(all(test, not(target_os = "linux")))]
+mod tests {
+    use super::*;
+
+    const REFUSAL: &str = "NOEXEC is currently only supported on Linux";
+
+    // With --background, run_command ends its caller with exit(0) after forking, so it must
+    // not run in the test runner itself. A fresh copy of the test binary is used instead of a
+    // forked copy of the multithreaded runner, which may only make async-signal-safe calls.
+    fn check_refusal(background: bool) -> ! {
+        // SAFETY: alarm has no memory-safety requirements. This process runs only this test.
+        unsafe { libc::alarm(10) };
+        let user = User::real().unwrap().unwrap();
+        let group = user.primary_group().unwrap();
+        let options = RunOptions {
+            command: Path::new("/usr/bin/true"),
+            arguments: &[],
+            arg0: None,
+            chdir: None,
+            is_login: false,
+            user: &user,
+            group: &group,
+            umask: Umask::Preserve,
+            background,
+            use_pty: false,
+            noexec: true,
+        };
+
+        let error = run_command(options, std::iter::empty::<(&str, &str)>()).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::Other);
+        assert_eq!(error.to_string(), REFUSAL);
+        _exit(42)
+    }
+
+    #[test]
+    fn unsupported_noexec_is_refused_before_backgrounding() {
+        const CHILD_MODE: &str = "SUDO_RS_TEST_UNSUPPORTED_NOEXEC";
+        if let Ok(mode) = std::env::var(CHILD_MODE) {
+            check_refusal(mode == "background");
+        }
+
+        for mode in ["foreground", "background"] {
+            let mut child = Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "exec::tests::unsupported_noexec_is_refused_before_backgrounding",
+                    "--nocapture",
+                ])
+                .env(CHILD_MODE, mode)
+                .spawn()
+                .unwrap();
+            // The child's alarm only starts once it runs, so bound the wait here too.
+            let deadline = std::time::Instant::now() + Duration::from_secs(60);
+            let status = loop {
+                if let Some(status) = child.try_wait().unwrap() {
+                    break status;
+                }
+                if std::time::Instant::now() > deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    panic!("{mode}: the test process did not exit within 60 seconds");
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            };
+            // This is the status of the process that called run_command. Without the early
+            // refusal it exits 0 when forking for --background, and only the detached child
+            // sees the error. A test filter that matches nothing would also exit 0.
+            assert_eq!(status.code(), Some(42), "{mode}: refusal missed the caller");
+        }
+    }
 }
