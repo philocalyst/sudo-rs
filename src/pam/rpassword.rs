@@ -323,7 +323,9 @@ impl TimeoutRead<'_> {
         #[cfg(any(target_os = "linux", target_os = "freebsd"))]
         let pollmask = libc::POLLIN | libc::POLLRDHUP;
         #[cfg(any(target_os = "macos", target_os = "netbsd"))]
-        // "POLLRDHUP is not supported on MacOS and NetBSD"
+        // These platforms report pipe EOF with POLLHUP, even when only
+        // POLLIN was requested. POLLHUP is checked below before read returns 0.
+        // https://man.netbsd.org/poll.2
         let pollmask = libc::POLLIN;
 
         let mut pollfd = [libc::pollfd {
@@ -487,6 +489,19 @@ mod test {
             let [pipe0, pipe1] = crate::cutils::mkpipe().unwrap();
             (File::from(pipe0), File::from(pipe1))
         }
+    }
+
+    #[test]
+    fn closed_writer_drains_data_then_reports_eof() {
+        let (rx, mut tx) = make_pipe();
+        tx.write_all(b"x").unwrap();
+        let mut reader = TimeoutRead::new(rx.as_fd(), Some(Duration::from_secs(2)));
+        // Prove the descriptor and reader work before closing the writer.
+        assert_eq!(reader.read_byte().unwrap(), Some(b'x'));
+        tx.write_all(b"y").unwrap();
+        drop(tx);
+        assert_eq!(reader.read_byte().unwrap(), Some(b'y'));
+        assert_eq!(reader.read_byte().unwrap(), None);
     }
 
     #[test]
