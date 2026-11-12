@@ -352,11 +352,43 @@ fn open_at(parent: BorrowedFd, file_name: &CStr, create: bool) -> io::Result<Own
     }
 }
 
-#[cfg(not(test))]
-#[cfg(any(target_os = "linux", target_os = "freebsd"))]
+#[cfg(any(not(test), target_os = "netbsd", target_os = "macos"))]
 fn faccess_at(parent: BorrowedFd, path: &CStr, mode: c_int, flags: c_int) -> io::Result<()> {
     // SAFETY: by design, a correct CStr pointer is passed to faccessat
     cerr(unsafe { libc::faccessat(parent.as_raw_fd(), path.as_ptr(), mode, flags) }).map(|_| ())
+}
+
+// These platforms have no AT_EMPTY_PATH: a directory is asked about as ".", other
+// files by their name in the directory they were opened from.
+#[cfg(any(target_os = "netbsd", target_os = "macos"))]
+fn user_can_modify_at(parent: BorrowedFd, path: &CStr) -> io::Result<bool> {
+    const RIGHTS: &[c_int] = &[libc::W_OK];
+    for &right in RIGHTS {
+        if access_allowed(faccess_at(parent, path, right, libc::AT_SYMLINK_NOFOLLOW))? {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+// As in original sudo, only these errors mean that the access is withheld: from
+// the user, by an immutable flag, or by a read-only file system. Any other error
+// leaves the question open, so it is passed on instead of read as a no.
+// https://github.com/sudo-project/sudo/blob/v1.9.17p2/src/edit_open.c#L192-L206
+#[cfg(any(target_os = "netbsd", target_os = "macos"))]
+fn access_allowed(result: io::Result<()>) -> io::Result<bool> {
+    match result {
+        Ok(()) => Ok(true),
+        Err(error)
+            if matches!(
+                error.raw_os_error(),
+                Some(libc::EACCES | libc::EPERM | libc::EROFS)
+            ) =>
+        {
+            Ok(false)
+        }
+        Err(error) => Err(error),
+    }
 }
 
 /// This opens a file for sudoedit, performing security checks (see below) and
@@ -408,7 +440,7 @@ fn traversed_secure_open(
         ));
     }
 
-    let user_cannot_write = |file: &File| -> io::Result<()> {
+    let user_cannot_write = |file: &File, _parent: BorrowedFd, _name: &CStr| -> io::Result<()> {
         let meta = file.metadata()?;
         let perms = meta.permissions().mode();
 
@@ -429,13 +461,22 @@ fn traversed_secure_open(
             // real user id rather than the effective user id.
             let writable = faccess_at(file.as_fd(), c"", libc::W_OK, libc::AT_EMPTY_PATH).is_ok();
 
-            #[cfg(any(test, target_os = "netbsd", target_os = "macos"))]
+            #[cfg(all(not(test), any(target_os = "netbsd", target_os = "macos")))]
+            let writable = if meta.is_dir() {
+                user_can_modify_at(file.as_fd(), c".")?
+            } else {
+                // The invoking user cannot rename entries in any ancestor: each
+                // has already passed the descriptor-based directory check.
+                user_can_modify_at(_parent, _name)?
+            };
+
+            #[cfg(test)]
             let writable = false;
 
             // During testing we do a less comprehensive check as we don't have
             // permission to set the real user id to arbitrary users, but faccessat
             // looks at the real user id.
-            // Also use this as a fallback on platforms that do not have faccessat.
+            // Keep the mode-bit check conservative even when the kernel denies access.
             writable
                 || perms & mode(Category::World, Op::Write) != 0
                 || (perms & mode(Category::Group, Op::Write) != 0)
@@ -455,7 +496,7 @@ fn traversed_secure_open(
     };
 
     let mut cur = File::open("/")?;
-    user_cannot_write(&cur)?;
+    user_cannot_write(&cur, cur.as_fd(), c".")?;
 
     for component in components {
         let dir: CString = match component {
@@ -474,20 +515,55 @@ fn traversed_secure_open(
             cur = open_at(cur.as_fd(), &dir, false)?.into();
             io::Result::Ok(())
         })??;
-        user_cannot_write(&cur)?;
+        user_cannot_write(&cur, cur.as_fd(), c".")?;
     }
-    sudo_call(target_user, target_group, || {
-        cur = open_at(cur.as_fd(), &CString::new(file_name.as_bytes())?, true)?.into();
-        io::Result::Ok(())
+    let name = CString::new(file_name.as_bytes())?;
+    let file: File = sudo_call(target_user, target_group, || {
+        open_at(cur.as_fd(), &name, true).map(File::from)
     })??;
-    user_cannot_write(&cur)?;
+    user_cannot_write(&file, cur.as_fd(), &name)?;
 
-    Ok(cur)
+    Ok(file)
 }
 
 #[cfg(test)]
 mod test {
     use super::*;
+
+    #[cfg(any(target_os = "netbsd", target_os = "macos"))]
+    #[test]
+    fn unexpected_access_errors_are_not_read_as_no() {
+        assert!(access_allowed(Ok(())).unwrap());
+        for code in [libc::EACCES, libc::EPERM, libc::EROFS] {
+            assert!(!access_allowed(Err(Error::from_raw_os_error(code))).unwrap());
+        }
+        for code in [libc::ENOENT, libc::EBADF, libc::EINVAL, libc::EIO] {
+            let error = access_allowed(Err(Error::from_raw_os_error(code))).unwrap_err();
+            assert_eq!(error.raw_os_error(), Some(code));
+        }
+        // a path the kernel cannot resolve is an error, never proof that it is safe
+        let root = File::open("/").unwrap();
+        let error = user_can_modify_at(root.as_fd(), c"dev/null/not-a-directory").unwrap_err();
+        assert_eq!(error.raw_os_error(), Some(libc::ENOTDIR));
+    }
+
+    // this test is allowed to fail if run as root -- do not run unit tests as root
+    #[cfg(any(target_os = "netbsd", target_os = "macos"))]
+    #[test]
+    fn user_can_modify_at_asks_about_directories_and_files() {
+        let dir = crate::system::file::create_temporary_dir().unwrap();
+        fs::write(dir.join("file"), "").unwrap();
+        let dir_fd = File::open(&dir).unwrap();
+        // a directory is asked about through ".", a file through its directory
+        let own_dir = user_can_modify_at(dir_fd.as_fd(), c".");
+        let own_file = user_can_modify_at(dir_fd.as_fd(), c"file");
+        fs::remove_dir_all(&dir).unwrap();
+        assert!(own_dir.unwrap());
+        assert!(own_file.unwrap());
+
+        let root = File::open("/").unwrap();
+        assert!(!user_can_modify_at(root.as_fd(), c".").unwrap());
+    }
 
     #[test]
     fn secure_open_is_predictable() {
