@@ -366,6 +366,19 @@ pub struct User {
     pub groups: Vec<GroupId>,
 }
 
+/// What one call of getgrouplist says: `Some(n)` if the user's `n` groups fitted in a
+/// buffer of `capacity` entries, `None` if a larger buffer is needed.
+fn getgrouplist_count(result: c_int, count: c_int, capacity: usize) -> io::Result<Option<usize>> {
+    if result == -1 {
+        return Ok(None);
+    }
+    // a negative count, or one that does not fit the buffer, is no answer to rely on
+    match usize::try_from(count) {
+        Ok(count) if count <= capacity => Ok(Some(count)),
+        _ => Err(io::ErrorKind::InvalidData.into()),
+    }
+}
+
 impl User {
     /// # Safety
     /// This function expects `pwd` to be a result from a successful call to `getpwXXX_r`.
@@ -375,7 +388,7 @@ impl User {
         // but on FreeBSD, getgrouplist does not specify this in its function contract, so a
         // blind allocation loop is needed.
         let Some(groups_buffer) =
-            dynamic_fill::<libc::gid_t, std::num::TryFromIntError>(32..65536, |groups_buffer| {
+            dynamic_fill::<libc::gid_t, io::Error>(32..65536, |groups_buffer| {
                 let mut buf_len: c_int = groups_buffer.len() as c_int;
                 // SAFETY: getgrouplist is passed valid pointers
                 // in particular `groups_buffer` is an array of `buf.len()` bytes, as required
@@ -388,15 +401,14 @@ impl User {
                     )
                 };
 
-                Ok(if result != -1 {
-                    Some(buf_len.try_into()?)
-                } else {
-                    None
-                })
-            })
-            .expect("negative group size, this should not happen")
+                getgrouplist_count(result, buf_len, groups_buffer.len())
+            })?
         else {
-            panic!("user has too many groups (> 65536), this should not happen");
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "group lookup exceeds 65536 entries",
+            )
+            .into());
         };
 
         // SAFETY: All pointers were initialized by a successful call to `getpwXXX_r` as per the
@@ -1024,6 +1036,20 @@ mod tests {
         test("dr. bill", "fidelio", 1999, &["eyes", "wide", "shut"]);
         test("eris", "fnord", 5, &[]);
         test("abc", "password123", 42, &[""]);
+    }
+
+    #[test]
+    fn getgrouplist_count_is_checked() {
+        use super::getgrouplist_count as count;
+        assert_eq!(count(0, 3, 32).unwrap(), Some(3));
+        assert_eq!(count(0, 32, 32).unwrap(), Some(32));
+        // the buffer was too small: dynamic_fill tries a larger one
+        assert_eq!(count(-1, 32, 32).unwrap(), None);
+        // a count that is negative or larger than the buffer is not trusted
+        for bad in [-1, 33] {
+            let error = count(0, bad, 32).unwrap_err();
+            assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        }
     }
 
     #[test]
