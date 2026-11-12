@@ -167,6 +167,11 @@ unsafe extern "C" fn pipe2(fds: *mut c_int, flags: c_int) -> c_int {
 
     // SAFETY: this is safe due to the contract on fcntl(2)
     let setflag = |fd| unsafe {
+        // F_SETFL ignores O_CLOEXEC: it is not a file status flag, but stands
+        // for the FD_CLOEXEC descriptor flag, which is set with F_SETFD.
+        if flags & libc::O_CLOEXEC != 0 {
+            cerr(libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC))?;
+        }
         let flag = cerr(libc::fcntl(fd, libc::F_GETFL))?;
         cerr(libc::fcntl(fd, libc::F_SETFL, flag | flags))
     };
