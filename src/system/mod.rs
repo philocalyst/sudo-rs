@@ -418,7 +418,7 @@ impl User {
         // but on FreeBSD, getgrouplist does not specify this in its function contract, so a
         // blind allocation loop is needed.
         let Some(groups_buffer) =
-            dynamic_fill::<libc::gid_t, std::num::TryFromIntError>(32..65536, |groups_buffer| {
+            dynamic_fill::<libc::gid_t, io::Error>(32..65536, |groups_buffer| {
                 let mut buf_len: c_int = groups_buffer.len() as c_int;
                 // SAFETY: getgrouplist is passed valid pointers
                 // in particular `groups_buffer` is an array of `buf.len()` bytes, as required
@@ -432,14 +432,22 @@ impl User {
                 };
 
                 Ok(if result != -1 {
-                    Some(buf_len.try_into()?)
+                    let len = usize::try_from(buf_len)
+                        .map_err(|_| io::Error::from(io::ErrorKind::InvalidData))?;
+                    if len > groups_buffer.len() {
+                        return Err(io::ErrorKind::InvalidData.into());
+                    }
+                    Some(len)
                 } else {
                     None
                 })
-            })
-            .expect("negative group size, this should not happen")
+            })?
         else {
-            panic!("user has too many groups (> 65536), this should not happen");
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "group lookup exceeds 65536 entries",
+            )
+            .into());
         };
 
         // SAFETY: All pointers were initialized by a successful call to `getpwXXX_r` as per the
