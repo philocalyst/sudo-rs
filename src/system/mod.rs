@@ -842,7 +842,8 @@ impl Process {
     /// attached to the given process
     #[cfg(target_os = "macos")]
     pub fn tty_device_id(pid: WithProcess) -> std::io::Result<Option<DeviceId>> {
-        Ok(None)
+        let info = Self::get_proc_info(pid)?;
+        Ok((info.e_tdev != u32::MAX).then(|| DeviceId::new(info.e_tdev as libc::dev_t)))
     }
 
     /// Get the process starting time of a specific process
@@ -887,7 +888,49 @@ impl Process {
     /// Get the process starting time of a specific process
     #[cfg(target_os = "macos")]
     pub fn starting_time(pid: WithProcess) -> io::Result<ProcessCreateTime> {
-        Ok(ProcessCreateTime::new(0, 0))
+        let info = Self::get_proc_info(pid)?;
+        let secs = i64::try_from(info.pbi_start_tvsec)
+            .map_err(|_| io::Error::from(io::ErrorKind::InvalidData))?;
+        if info.pbi_start_tvusec >= 1_000_000 {
+            return Err(io::ErrorKind::InvalidData.into());
+        }
+        Ok(ProcessCreateTime::new(
+            secs,
+            info.pbi_start_tvusec as i64 * 1000,
+        ))
+    }
+
+    #[cfg(target_os = "macos")]
+    fn get_proc_info(pid: WithProcess) -> io::Result<libc::proc_bsdinfo> {
+        let pid = match pid {
+            WithProcess::Current => Self::process_id().inner(),
+            WithProcess::Other(pid) => pid.inner(),
+        };
+        let mut info = MaybeUninit::<libc::proc_bsdinfo>::uninit();
+        // proc_pidbsdinfo exports the saved wall-clock p_start and a 32-bit NODEV.
+        // https://github.com/apple-oss-distributions/xnu/blob/xnu-11215.81.4/bsd/kern/proc_info.c
+        // SAFETY: info points to a buffer of the advertised size.
+        let size = unsafe {
+            libc::proc_pidinfo(
+                pid,
+                libc::PROC_PIDTBSDINFO,
+                0,
+                info.as_mut_ptr().cast(),
+                size_of::<libc::proc_bsdinfo>() as i32,
+            )
+        };
+        // libproc returns zero on failure, unlike the usual -1 convention.
+        if size <= 0 {
+            return Err(io::Error::last_os_error());
+        }
+        if size as usize != size_of::<libc::proc_bsdinfo>() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "incomplete process information",
+            ));
+        }
+        // SAFETY: proc_pidinfo returned exactly one fully initialized record.
+        Ok(unsafe { info.assume_init() })
     }
 }
 
@@ -1006,7 +1049,8 @@ mod tests {
     use crate::system::interface::{GroupId, ProcessId, UserId};
 
     use super::{
-        Group, ROOT_GROUP_NAME, User, WithProcess, fork_for_test, getpgrp, setpgid,
+        _exit, Group, Process, ProcessCreateTime, ROOT_GROUP_NAME, User, WithProcess,
+        fork_for_test, getpgrp, setpgid, setsid,
         wait::{Wait, WaitOptions},
     };
 
@@ -1094,8 +1138,90 @@ mod tests {
     }
 
     #[test]
-    fn get_process_tty_device() {
-        assert!(super::Process::tty_device_id(WithProcess::Current).is_ok());
+    fn process_queries_reject_a_missing_pid() {
+        let missing = || WithProcess::Other(ProcessId::new(i32::MAX));
+        // Linux exposes missing PIDs as missing procfs entries; BSD uses ESRCH.
+        let errno = if cfg!(target_os = "linux") {
+            libc::ENOENT
+        } else {
+            libc::ESRCH
+        };
+        assert_eq!(
+            Process::tty_device_id(missing())
+                .unwrap_err()
+                .raw_os_error(),
+            Some(errno)
+        );
+        assert_eq!(
+            Process::starting_time(missing())
+                .unwrap_err()
+                .raw_os_error(),
+            Some(errno)
+        );
+    }
+
+    #[test]
+    fn process_queries_identify_a_controlling_terminal() {
+        use crate::system::term::{Pty, Terminal};
+        use std::os::unix::{ffi::OsStrExt, fs::MetadataExt};
+        let pty = Pty::open().unwrap();
+        let dev = std::fs::metadata(std::ffi::OsStr::from_bytes(pty.path.as_bytes()))
+            .unwrap()
+            .rdev();
+        let parent_start = Process::starting_time(WithProcess::Current).unwrap();
+        // SAFETY: follows fork_for_test: the child uses syscall wrappers and
+        // assertions, never directory-service lookups, and exits through _exit.
+        let child = unsafe {
+            fork_for_test(|| {
+                setsid().unwrap();
+                assert_eq!(Process::tty_device_id(WithProcess::Current).unwrap(), None);
+                pty.follower.make_controlling_terminal().unwrap();
+                let tty = Process::tty_device_id(WithProcess::Current)
+                    .unwrap()
+                    .unwrap();
+                #[allow(clippy::unnecessary_cast)] // macOS sign-extends its i32 dev_t.
+                let reported_dev = tty.inner() as u64;
+                assert_eq!(reported_dev, dev);
+                assert_eq!(
+                    Process::tty_device_id(WithProcess::Other(Process::process_id())).unwrap(),
+                    Some(tty)
+                );
+                let start = Process::starting_time(WithProcess::Current).unwrap();
+                assert!(start > ProcessCreateTime::new(0, 0));
+                assert!(start >= parent_start);
+                assert!(start <= ProcessCreateTime::now().unwrap());
+                assert_eq!(
+                    start,
+                    Process::starting_time(WithProcess::Other(Process::process_id())).unwrap()
+                );
+                _exit(0);
+            })
+        };
+        let mut status = 0;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            // SAFETY: child is our child and status is writable.
+            let result = unsafe { libc::waitpid(child.inner(), &mut status, libc::WNOHANG) };
+            if result == child.inner() {
+                break;
+            }
+            if result < 0 && io::Error::last_os_error().raw_os_error() == Some(libc::EINTR) {
+                continue;
+            }
+            if result < 0 || std::time::Instant::now() >= deadline {
+                // SAFETY: kill and reap only our still-running child.
+                unsafe {
+                    libc::kill(child.inner(), libc::SIGKILL);
+                    while libc::waitpid(child.inner(), &mut status, 0) < 0
+                        && io::Error::last_os_error().raw_os_error() == Some(libc::EINTR)
+                    {
+                    }
+                }
+                panic!("process query child failed to complete");
+            }
+            std::thread::yield_now();
+        }
+        assert_eq!(status, 0);
     }
 
     #[test]
