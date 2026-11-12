@@ -423,9 +423,10 @@ fn default_set_test() {
 }
 
 #[test]
-fn lecture_file_has_the_syntax_of_original_sudo() {
+fn lecture_file_accepts_assignments_and_negation() {
     // original sudo declares lecture_file as a path that can be negated
-    // (T_STR|T_PATH|T_BOOL in plugins/sudoers/def_data.in)
+    // (T_STR|T_PATH|T_BOOL in plugins/sudoers/def_data.in). Like other
+    // ignored string settings, we do not validate the unused path value.
     for line in [
         "Defaults lecture_file = \"/etc/sudo_lecture\"",
         "Defaults lecture_file=/etc/sudo_lecture",
