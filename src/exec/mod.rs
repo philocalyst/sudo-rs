@@ -359,14 +359,14 @@ const fn opt_fmt(cond: bool, s: &str) -> &str {
 #[cfg(all(test, not(target_os = "linux")))]
 mod tests {
     use super::*;
-    use crate::system::fork_for_test;
 
     const REFUSAL: &str = "NOEXEC is currently only supported on Linux";
 
-    /// Calls `run_command` with NOEXEC, which this platform cannot enforce, in a child process
-    /// that stands in for the sudo started by the user. Returns the exit status of that child:
-    /// 42 if `run_command` returned the refusal to it.
-    fn exit_status_of_invoking_sudo(background: bool) -> Option<i32> {
+    // Re-execute the test binary so the regression cannot terminate the test runner and
+    // the test does not call allocation routines in a forked copy of the test harness.
+    fn check_refusal(background: bool) -> ! {
+        // SAFETY: alarm has no memory-safety requirements. This process runs only this test.
+        unsafe { libc::alarm(10) };
         let user = User::real().unwrap().unwrap();
         let group = user.primary_group().unwrap();
         let options = RunOptions {
@@ -383,32 +383,32 @@ mod tests {
             noexec: true,
         };
 
-        // SAFETY: Not really safe, but this is test only code.
-        let invoking_sudo = unsafe {
-            fork_for_test(|| {
-                let result = run_command(options, std::iter::empty::<(&str, &str)>());
-                match result {
-                    Err(err) if err.to_string() == REFUSAL => _exit(42),
-                    _ => _exit(1),
-                }
-            })
-        };
-        let (_, status) = invoking_sudo.wait(WaitOptions::new()).unwrap();
-        status.exit_status()
+        let error = run_command(options, std::iter::empty::<(&str, &str)>()).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::Other);
+        assert_eq!(error.to_string(), REFUSAL);
+        _exit(42)
     }
 
     #[test]
     fn unsupported_noexec_is_refused_before_backgrounding() {
-        // Without `-b`, the refusal reaches the process that called run_command.
-        assert_eq!(exit_status_of_invoking_sudo(false), Some(42));
+        const CHILD_MODE: &str = "SUDO_RS_TEST_UNSUPPORTED_NOEXEC";
+        if let Ok(mode) = std::env::var(CHILD_MODE) {
+            check_refusal(mode == "background");
+        }
 
-        // With `-b` it must as well. If run_command forked first, the invoking sudo exits with
-        // status 0 inside run_command, and only the detached process, whose exit status nobody
-        // sees, is refused.
-        assert_eq!(
-            exit_status_of_invoking_sudo(true),
-            Some(42),
-            "the refusal did not reach the invoking sudo"
-        );
+        for mode in ["foreground", "background"] {
+            let status = Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "exec::tests::unsupported_noexec_is_refused_before_backgrounding",
+                    "--nocapture",
+                ])
+                .env(CHILD_MODE, mode)
+                .status()
+                .unwrap();
+            // An unpatched background invocation exits 0 before reaching the refusal.
+            // A test selection mistake also exits 0, so it cannot pass this assertion.
+            assert_eq!(status.code(), Some(42), "{mode}: refusal missed the caller");
+        }
     }
 }
