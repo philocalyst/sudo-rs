@@ -23,8 +23,14 @@ impl SystemTime {
     pub fn now() -> std::io::Result<SystemTime> {
         #[cfg(any(target_os = "linux", target_os = "freebsd"))]
         let clock_source = libc::CLOCK_BOOTTIME;
-        #[cfg(any(target_os = "macos", target_os = "netbsd"))]
+        #[cfg(target_os = "netbsd")]
         let clock_source = libc::CLOCK_MONOTONIC;
+        // As in original sudo. On macOS, CLOCK_MONOTONIC also keeps counting during
+        // sleep, but it is the wall clock minus the boot time; CLOCK_MONOTONIC_RAW
+        // is mach_continuous_time, which does not depend on the wall clock.
+        // https://github.com/apple-oss-distributions/Libc/blob/Libc-1752.120.2/gen/clock_gettime.c#L86-L116
+        #[cfg(target_os = "macos")]
+        let clock_source = libc::CLOCK_MONOTONIC_RAW;
 
         let mut spec = MaybeUninit::<libc::timespec>::uninit();
         // SAFETY: valid pointer is passed to clock_gettime
@@ -177,6 +183,25 @@ impl ProcessCreateTime {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn system_time_is_continuous_time() {
+        let raw = || {
+            let mut spec = MaybeUninit::<libc::timespec>::uninit();
+            // SAFETY: valid pointer is passed to clock_gettime
+            let result =
+                unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC_RAW, spec.as_mut_ptr()) };
+            assert_eq!(result, 0);
+            // SAFETY: clock_gettime succeeded, so it initialized spec
+            SystemTime::from(unsafe { spec.assume_init() })
+        };
+        // This holds for CLOCK_MONOTONIC_RAW on any host. It only catches another clock
+        // where that differs by more than the time between the readings, as
+        // CLOCK_MONOTONIC does once the wall clock has been adjusted after boot.
+        let (before, now, after) = (raw(), SystemTime::now().unwrap(), raw());
+        assert!(before <= now && now <= after);
+    }
 
     #[test]
     fn test_new_system_time() {
