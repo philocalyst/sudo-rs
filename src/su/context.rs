@@ -216,7 +216,7 @@ impl SuContext {
 
 #[cfg(test)]
 mod tests {
-    use std::path::PathBuf;
+    use std::{ffi::OsStr, path::PathBuf};
 
     use crate::{
         common::{Error, resolve::CurrentUser},
@@ -246,6 +246,35 @@ mod tests {
         let context = SuContext::from_env(options).unwrap();
 
         assert_eq!(context.user.name, "root");
+    }
+
+    #[test]
+    fn login_shell_starts_with_the_platform_default_path() {
+        // the PATH that the platform's own su gives a login shell
+        let (root_path, user_path) = if cfg!(target_os = "macos") {
+            ("/bin:/usr/bin", "/bin:/usr/bin")
+        } else {
+            (
+                "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+                "/usr/local/bin:/usr/bin:/bin:/usr/local/games:/usr/games",
+            )
+        };
+        let cur_user = CurrentUser::resolve().unwrap();
+        // this test is allowed to fail if run as root -- do not run unit tests as root
+        for (target, expected) in [("root", root_path), (&*cur_user.name, user_path)] {
+            let login = SuContext::from_env(get_options(&["-l", target])).unwrap();
+            assert_eq!(
+                login.environment.get(OsStr::new("PATH")),
+                Some(&expected.into())
+            );
+
+            // without --login, su keeps the caller's PATH
+            let plain = SuContext::from_env(get_options(&[target])).unwrap();
+            assert_eq!(
+                plain.environment.get(OsStr::new("PATH")),
+                std::env::var_os("PATH").as_ref()
+            );
+        }
     }
 
     #[test]
