@@ -295,29 +295,52 @@ impl Context {
 
 #[cfg(test)]
 mod tests {
-    use crate::{common::resolve::CurrentUser, sudo::SudoAction, system::Hostname};
+    use std::fs;
+    use std::os::unix::fs::{PermissionsExt, symlink};
+
+    use crate::{
+        common::resolve::CurrentUser,
+        sudo::SudoAction,
+        sudoers::Sudoers,
+        system::{Hostname, file::create_temporary_dir},
+    };
 
     use super::Context;
 
     #[test]
     fn test_build_run_context() {
-        let mut options = SudoAction::try_parse_from(["sudo", "echo", "hello"])
-            .unwrap()
-            .try_into_run()
-            .ok()
-            .unwrap();
-
         let current_user = CurrentUser::resolve().unwrap();
-        options.user = Some(current_user.name.clone());
+        let options = || {
+            let mut options = SudoAction::try_parse_from(["sudo", "echo", "hello"])
+                .unwrap()
+                .try_into_run()
+                .ok()
+                .unwrap();
+            options.user = Some(current_user.name.clone());
+            options
+        };
 
-        let context = Context::from_run_opts(options, &mut Default::default()).unwrap();
+        // Give the policy a secure_path, so that `echo` is looked up in a directory made for
+        // this test and not on the PATH of whoever runs it. That directory is reached through
+        // a symlink, which the resolved command must not contain.
+        let dir = create_temporary_dir().unwrap();
+        fs::create_dir(dir.join("bin")).unwrap();
+        fs::write(dir.join("bin/echo"), "").unwrap();
+        fs::set_permissions(dir.join("bin/echo"), fs::Permissions::from_mode(0o755)).unwrap();
+        symlink("bin", dir.join("link")).unwrap();
+        let (mut policy, errors) = Sudoers::read(
+            format!("Defaults secure_path=\"{}\"\n", dir.join("link").display()).as_bytes(),
+            "/etc/fakesudoers",
+        )
+        .unwrap();
 
-        if cfg!(target_os = "linux") {
-            // this assumes /bin is a symlink on /usr/bin, like it is on modern Debian/Ubuntu
-            assert_eq!(context.command.command.to_str().unwrap(), "/usr/bin/echo");
-        } else {
-            assert_eq!(context.command.command.to_str().unwrap(), "/bin/echo");
-        }
+        let context = Context::from_run_opts(options(), &mut policy);
+        let bin = fs::canonicalize(dir.join("bin")).unwrap();
+        fs::remove_dir_all(&dir).unwrap();
+
+        assert!(errors.is_empty());
+        let context = context.unwrap();
+        assert_eq!(context.command.command, bin.join("echo"));
         assert_eq!(context.command.arguments, ["hello"]);
         assert_eq!(context.hostname, Hostname::resolve());
         assert_eq!(context.target_user.uid, current_user.uid);
