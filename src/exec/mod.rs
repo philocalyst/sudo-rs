@@ -83,6 +83,15 @@ pub fn run_command(
     options: RunOptions<'_>,
     env: impl IntoIterator<Item = (impl AsRef<OsStr>, impl AsRef<OsStr>)>,
 ) -> io::Result<ExitReason> {
+    // Refuse before forking for `-b`, so that the invoking sudo, not the detached one, reports
+    // the error.
+    #[cfg(not(target_os = "linux"))]
+    if options.noexec {
+        return Err(io::Error::other(
+            "NOEXEC is currently only supported on Linux",
+        ));
+    }
+
     if options.background {
         // SAFETY: There should be no other threads at this point.
         match unsafe { fork() }? {
@@ -117,17 +126,15 @@ pub fn run_command(
         command.arg0(OsStr::from_bytes(&process_name));
     }
 
+    #[cfg(target_os = "linux")]
     let spawn_noexec_handler = if options.noexec {
-        #[cfg(not(target_os = "linux"))]
-        return Err(io::Error::other(
-            "NOEXEC is currently only supported on Linux",
-        ));
-
-        #[cfg(target_os = "linux")]
         Some(noexec::add_noexec_filter(&mut command)?)
     } else {
         None
     };
+    // NOEXEC was refused at the start of this function.
+    #[cfg(not(target_os = "linux"))]
+    let spawn_noexec_handler = None;
 
     // Decide if the pwd should be changed. `--chdir` takes precedence over `-i`.
     let path = options
