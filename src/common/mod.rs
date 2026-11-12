@@ -27,6 +27,23 @@ pub const HARDENED_ENUM_VALUE_3: u32 = 0x1629e037; // 00101100010100111100000001
 pub const HARDENED_ENUM_VALUE_4: u32 = 0x1fc8d3ac; // 11111110010001101001110101100
 pub const HARDENED_ENUM_VALUE_5: u32 = 0x70372c52; // 1110000001101110010110001010011
 
+#[cfg_attr(not(feature = "dev"), allow(dead_code))]
+pub(crate) fn unstable_warning() {
+    let check_var = std::env::var("SUDO_RS_IS_UNSTABLE").unwrap_or_default();
+
+    if check_var != "I accept that my system may break unexpectedly" {
+        eprintln_ignore_io_error!(
+            "WARNING!
+Sudo-rs is compiled with development logs on, which means it is less secure and could potentially
+break your system. We recommend that you do not run this on any production environment.
+To turn off this warning and use sudo-rs you need to set the environment variable
+SUDO_RS_IS_UNSTABLE to the value `I accept that my system may break unexpectedly`."
+        );
+
+        std::process::exit(1);
+    }
+}
+
 // FIXME replace with OsStr::display() once our MSRV is 1.87
 pub(crate) struct DisplayOsStr<'a>(pub(crate) &'a OsStr);
 

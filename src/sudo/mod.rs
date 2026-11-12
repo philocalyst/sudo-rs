@@ -23,23 +23,6 @@ pub(crate) use env::environment::PATH_DEFAULT;
 mod pam;
 mod pipeline;
 
-#[cfg_attr(not(feature = "dev"), allow(dead_code))]
-fn unstable_warning() {
-    let check_var = std::env::var("SUDO_RS_IS_UNSTABLE").unwrap_or_default();
-
-    if check_var != "I accept that my system may break unexpectedly" {
-        eprintln_ignore_io_error!(
-            "WARNING!
-Sudo-rs is compiled with development logs on, which means it is less secure and could potentially
-break your system. We recommend that you do not run this on any production environment.
-To turn off this warning and use sudo-rs you need to set the environment variable
-SUDO_RS_IS_UNSTABLE to the value `I accept that my system may break unexpectedly`."
-        );
-
-        std::process::exit(1);
-    }
-}
-
 const VERSION: &str = if let Some(version_override) = std::option_env!("SUDO_RS_VERSION") {
     version_override
 } else {
@@ -115,7 +98,7 @@ fn sudo_process() -> Result<(), Error> {
                 );
 
                 #[cfg(feature = "dev")]
-                unstable_warning();
+                crate::common::unstable_warning();
 
                 // SudoAction::from_env() should already ensure this
                 assert!(!options.positional_args.is_empty() || options.shell || options.login);
