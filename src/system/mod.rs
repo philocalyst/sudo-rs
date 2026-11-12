@@ -2,7 +2,7 @@
 use std::str::FromStr;
 use std::{
     ffi::{CStr, c_int, c_long},
-    fmt, fs, io,
+    fmt, io,
     mem::MaybeUninit,
     ops,
     os::unix,
@@ -95,11 +95,37 @@ pub(crate) fn mark_fds_as_cloexec() -> io::Result<()> {
     mark_fds_as_cloexec_fallback(STDERR_FILENO + 1)
 }
 
+#[cfg(target_os = "netbsd")]
+fn mark_fds_as_cloexec_fallback(lowfd: i32) -> io::Result<()> {
+    // F_MAXFD reads the actual descriptor table, even after RLIMIT_NOFILE is
+    // lowered. Unlike /proc/self/fd this needs no mounted filesystem.
+    // https://github.com/NetBSD/src/blob/netbsd-10/sys/kern/sys_descrip.c#L350-L380
+    set_errno(0);
+    // SAFETY: F_MAXFD ignores the descriptor argument and takes no pointer.
+    let highest = unsafe { libc::fcntl(0, libc::F_MAXFD) };
+    // An empty descriptor table also returns -1, without setting errno.
+    if highest == -1 && io::Error::last_os_error().raw_os_error() != Some(0) {
+        return Err(io::Error::last_os_error());
+    }
+    for fd in lowfd..=highest {
+        // SAFETY: this changes only the descriptor's close-on-exec flag.
+        match cerr(unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) }) {
+            // Gaps in the descriptor table are expected.
+            Err(err) if err.raw_os_error() == Some(libc::EBADF) => (),
+            result => {
+                result?;
+            }
+        }
+    }
+    Ok(())
+}
+
+#[cfg(any(target_os = "linux", target_os = "freebsd", target_os = "macos"))]
 fn mark_fds_as_cloexec_fallback(lowfd: i32) -> io::Result<()> {
     // If the kernel doesn't support close_range or CLOSE_RANGE_CLOEXEC,
     // fallback to finding all open fds using /proc/self/fd or /dev/fd
 
-    for entry in fs::read_dir(if cfg!(any(target_os = "linux", target_os = "netbsd")) {
+    for entry in std::fs::read_dir(if cfg!(any(target_os = "linux", target_os = "netbsd")) {
         "/proc/self/fd"
     } else {
         "/dev/fd"
@@ -1003,10 +1029,7 @@ mod tests {
 
     use crate::system::interface::{GroupId, ProcessId, UserId};
 
-    use super::{
-        Group, ROOT_GROUP_NAME, User, WithProcess, fork_for_test, getpgrp, setpgid,
-        wait::{Wait, WaitOptions},
-    };
+    use super::{Group, ROOT_GROUP_NAME, User, WithProcess, fork_for_test, getpgrp, setpgid};
 
     pub(super) fn tempfile() -> std::io::Result<std::fs::File> {
         let timestamp = std::time::SystemTime::now()
@@ -1178,32 +1201,123 @@ mod tests {
 
     #[test]
     fn mark_fds_as_cloexec() {
-        let child_pid = unsafe {
-            fork_for_test(|| {
-                let should_close =
-                    std::fs::File::create(std::env::temp_dir().join("should_close.txt")).unwrap();
-                crate::cutils::cerr(libc::fcntl(
-                    should_close.as_fd().as_raw_fd(),
-                    libc::F_SETFD,
-                    0,
-                ))
+        check_cloexec(
+            "system::tests::mark_fds_as_cloexec",
+            super::mark_fds_as_cloexec,
+        );
+    }
+
+    // FreeBSD's legacy /dev/fd fallback requires a mounted fdescfs. Its
+    // close_range path is covered above; changing the legacy fallback is separate.
+    #[cfg(any(target_os = "linux", target_os = "netbsd", target_os = "macos"))]
+    #[test]
+    fn cloexec_fallback_marks_descriptors_above_lowered_limit() {
+        check_cloexec(
+            "system::tests::cloexec_fallback_marks_descriptors_above_lowered_limit",
+            || super::mark_fds_as_cloexec_fallback(3),
+        );
+    }
+
+    fn descriptor_test_command(test: &str) -> std::process::Command {
+        let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+        command.args(["--exact", test]);
+        command
+    }
+
+    // Called only in a freshly executed subprocess, never between fork and exec.
+    fn high_descriptor(file: &std::fs::File) -> i32 {
+        use crate::cutils::cerr;
+        unsafe {
+            libc::alarm(10);
+            let mut limit = std::mem::zeroed::<libc::rlimit>();
+            cerr(libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit)).unwrap();
+            limit.rlim_cur = limit.rlim_max.min(2048);
+            cerr(libc::setrlimit(libc::RLIMIT_NOFILE, &limit)).unwrap();
+            // Cross the 1024 boundary where allowed, but also run on hosts whose
+            // hard limit is lower. Never modify the parent's resource limits.
+            let minimum = limit.rlim_cur.saturating_sub(1).min(1536) as i32;
+            assert!(
+                minimum >= 128,
+                "descriptor tests require a hard limit of at least 129"
+            );
+            let high = cerr(libc::fcntl(file.as_raw_fd(), libc::F_DUPFD, minimum)).unwrap();
+            assert_eq!(libc::fcntl(high, libc::F_GETFD), 0);
+            limit.rlim_cur = 64;
+            cerr(libc::setrlimit(libc::RLIMIT_NOFILE, &limit)).unwrap();
+            high
+        }
+    }
+
+    #[test]
+    fn cloexec_is_observed_across_exec() {
+        use std::os::unix::process::CommandExt;
+        const TEST: &str = "system::tests::cloexec_is_observed_across_exec";
+        const PROBE: &str = "SUDO_RS_CLOEXEC_TEST_STAGE";
+        if let Ok(stage) = std::env::var(PROBE) {
+            if let Some(mark) = stage.strip_prefix("setup:") {
+                let file = std::fs::File::open("/dev/null").unwrap();
+                let high = high_descriptor(&file);
+                let mut command = descriptor_test_command(TEST);
+                command.env(PROBE, format!("probe:{high}:{mark}"));
+                if mark == "true" {
+                    super::mark_fds_as_cloexec().unwrap();
+                }
+                // exec replaces this fresh process directly. There is no pre_exec
+                // callback allocating in a forked copy of the threaded test runner.
+                panic!("exec probe failed: {}", command.exec());
+            }
+            let probe = stage.strip_prefix("probe:").unwrap();
+            let (fd, closed) = probe.split_once(':').unwrap();
+            let fd = fd.parse::<i32>().unwrap();
+            let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+            if closed == "true" {
+                assert_eq!(flags, -1);
+                assert_eq!(io::Error::last_os_error().raw_os_error(), Some(libc::EBADF));
+            } else {
+                assert_eq!(flags, 0);
+            }
+            super::_exit(42);
+        }
+        // Control first: the same fixture must survive exec without marking.
+        for mark in [false, true] {
+            let status = descriptor_test_command(TEST)
+                .env(PROBE, format!("setup:{mark}"))
+                .status()
                 .unwrap();
-                assert!(!is_cloexec(&should_close));
+            // Zero tests selected must not be mistaken for successful assertions.
+            assert_eq!(status.code(), Some(42));
+        }
+    }
 
-                super::mark_fds_as_cloexec().unwrap();
+    fn check_cloexec(test: &str, mark: fn() -> io::Result<()>) {
+        use crate::cutils::cerr;
+        const PROBE: &str = "SUDO_RS_CLOEXEC_FLAGS_TEST";
+        if std::env::var(PROBE).as_deref() != Ok(test) {
+            let status = descriptor_test_command(test)
+                .env(PROBE, test)
+                .status()
+                .unwrap();
+            assert_eq!(status.code(), Some(42));
+            return;
+        }
+        let file = std::fs::File::open("/dev/null").unwrap();
+        let high = high_descriptor(&file);
+        let standard_flags = [0, 1, 2].map(|fd| unsafe { libc::fcntl(fd, libc::F_GETFD) });
+        cerr(unsafe { libc::fcntl(file.as_raw_fd(), libc::F_SETFD, 0) }).unwrap();
+        assert!(!is_cloexec(&file));
 
-                assert!(is_cloexec(&should_close));
+        mark().unwrap();
 
-                assert!(!is_cloexec(&io::stdin()));
-                assert!(!is_cloexec(&io::stdout()));
-                assert!(!is_cloexec(&io::stderr()));
-
-                exit(0)
-            })
-        };
-
-        let (_, status) = child_pid.wait(WaitOptions::new()).unwrap();
-        assert_eq!(status.exit_status(), Some(0));
+        assert!(is_cloexec(&file));
+        assert_eq!(
+            unsafe { libc::fcntl(high, libc::F_GETFD) },
+            libc::FD_CLOEXEC
+        );
+        assert_eq!(
+            [0, 1, 2].map(|fd| unsafe { libc::fcntl(fd, libc::F_GETFD) }),
+            standard_flags
+        );
+        super::_exit(42);
     }
 
     #[cfg(target_os = "linux")]
