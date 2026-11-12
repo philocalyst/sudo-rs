@@ -339,8 +339,11 @@ mod tests {
                 // Open a new pseudoterminal.
                 let leader = Pty::open().unwrap().leader;
                 // On FreeBSD this returns an unspecified PID when there is no foreground process
-                // group, so skip this check on FreeBSD.
-                if cfg!(target_os = "linux") {
+                // group, so skip this check on FreeBSD. NetBSD tty.c requires
+                // a controlling terminal for TIOCGPGRP (ENOTTY otherwise);
+                // its pty driver may override this, so no initial value is assumed.
+                // https://github.com/NetBSD/src/blob/netbsd-10/sys/kern/tty.c
+                if cfg!(any(target_os = "linux", target_os = "macos")) {
                     // The pty leader should not have a foreground process group yet.
                     assert_eq!(leader.tcgetpgrp().unwrap().inner(), 0);
                 }
