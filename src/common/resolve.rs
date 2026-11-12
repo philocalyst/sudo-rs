@@ -339,46 +339,37 @@ pub fn canonicalize_newfile<P: AsRef<Path>>(path: P) -> io::Result<PathBuf> {
 #[cfg(test)]
 mod test {
     use super::canonicalize;
-    use std::path::Path;
+    use crate::system::file::create_temporary_dir;
+    use std::{fs, io, os::unix::fs::symlink, path::Path};
 
     #[test]
     fn canonicalization() {
         assert_eq!(canonicalize("/").unwrap(), Path::new("/"));
         assert!(canonicalize("").is_err());
-        if cfg!(any(target_os = "linux")) {
-            // this test REQUIRES /usr/bin/unxz to be a symlink for /usr/bin/xz or /usr/bin/busybox
-            assert!(Path::new("/bin").is_symlink());
-            assert!(Path::new("/usr/bin/unxz").is_symlink());
-            assert_eq!(
-                canonicalize("/usr/bin/unxz").unwrap(),
-                Path::new("/usr/bin/unxz")
-            );
-            // this assumes /bin is a symlink on /usr/bin, like it is on modern Debian/Ubuntu
-            assert_eq!(
-                canonicalize("/bin/unxz").unwrap(),
-                Path::new("/usr/bin/unxz")
-            );
-        } else if cfg!(target_os = "freebsd") {
-            // this test REQUIRES /usr/bin/pkill to be a symlink
-            assert!(Path::new("/usr/bin/pkill").is_symlink());
-            assert_eq!(
-                canonicalize("/usr/bin/pkill").unwrap(),
-                Path::new("/usr/bin/pkill")
-            );
-            assert_eq!(canonicalize("/bin/pkill").unwrap(), Path::new("/bin/pkill"));
-        } else if cfg!(target_os = "netbsd") {
-            // this test REQUIRES /usr/bin/cpio to be a symlink
-            assert!(Path::new("/usr/bin/cpio").is_symlink());
-            assert_eq!(
-                canonicalize("/usr/bin/cpio").unwrap(),
-                Path::new("/usr/bin/cpio")
-            );
-            assert_eq!(canonicalize("/bin/cpio").unwrap(), Path::new("/bin/cpio"));
-        } else {
-            panic!(
-                "canonicalization test not yet adapted for {}",
-                std::env::consts::OS
-            );
-        }
+
+        // Build the symlinks instead of relying on how a particular system lays out
+        // /bin and /usr/bin:
+        //   real/file
+        //   real/link -> file
+        //   alias     -> real
+        let dir = create_temporary_dir().unwrap();
+        fs::create_dir(dir.join("real")).unwrap();
+        fs::write(dir.join("real/file"), "").unwrap();
+        symlink("file", dir.join("real/link")).unwrap();
+        symlink("real", dir.join("alias")).unwrap();
+
+        let link = canonicalize(dir.join("real/link"));
+        let link_through_alias = canonicalize(dir.join("alias/link"));
+        let missing = canonicalize(dir.join("real/missing"));
+        // the temporary directory itself can be behind a symlink (/tmp on macOS)
+        let real = fs::canonicalize(dir.join("real")).unwrap();
+        fs::remove_dir_all(&dir).unwrap();
+
+        // a symlink in the last component is kept...
+        assert_eq!(link.unwrap(), real.join("link"));
+        // ...also when a directory leading up to it is a symlink, which is resolved
+        assert_eq!(link_through_alias.unwrap(), real.join("link"));
+        // and the path must exist
+        assert_eq!(missing.unwrap_err().kind(), io::ErrorKind::NotFound);
     }
 }
