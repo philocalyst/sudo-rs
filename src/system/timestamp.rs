@@ -33,10 +33,10 @@ pub struct SessionRecordFile {
 }
 
 impl SessionRecordFile {
-    #[cfg(any(target_os = "linux", target_os = "freebsd", target_os = "netbsd"))]
+    // Boot-relative timestamps must not survive reboot. /var/db persists on
+    // macOS, whereas /var/run is cleared by the boot environment.
+    // https://github.com/apple-oss-distributions/launchd/blob/main/support/launchctl.c
     const BASE_PATH: &'static str = "/var/run/sudo-rs/ts";
-    #[cfg(target_os = "macos")]
-    const BASE_PATH: &'static str = "/var/db/sudo-rs/ts";
 
     pub fn open_for_user(user: &CurrentUser, timeout: Duration) -> io::Result<Self> {
         let uid = user.uid;
@@ -611,6 +611,15 @@ mod tests {
             shell: Path::new("/bin/sh").to_owned(),
             groups: vec![],
         })
+    }
+
+    #[test]
+    fn timestamp_directory_is_in_boot_runtime_storage() {
+        assert_eq!(SessionRecordFile::BASE_PATH, "/var/run/sudo-rs/ts");
+        let runtime = std::fs::metadata("/var/run").unwrap();
+        use std::os::unix::fs::MetadataExt;
+        assert_eq!(runtime.uid(), 0);
+        assert_eq!(runtime.mode() & 0o002, 0);
     }
 
     #[test]

@@ -5,7 +5,8 @@ use std::{
     time::Duration,
 };
 
-/// A timestamp relative to `CLOCK_BOOTTIME`.
+/// A timestamp on the platform's monotonic clock, independent of wall-clock steps.
+/// Suspend accounting is platform-specific; macOS and Linux count suspended time.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub struct SystemTime {
     secs: i64,
@@ -23,8 +24,16 @@ impl SystemTime {
     pub fn now() -> std::io::Result<SystemTime> {
         #[cfg(any(target_os = "linux", target_os = "freebsd"))]
         let clock_source = libc::CLOCK_BOOTTIME;
-        #[cfg(any(target_os = "macos", target_os = "netbsd"))]
+        // NetBSD exposes no separate suspend-counting clock. Its MONOTONIC
+        // clock is nanouptime; suspend accounting depends on the timecounter.
+        // https://github.com/NetBSD/src/blob/netbsd-10/sys/kern/subr_time.c
+        #[cfg(target_os = "netbsd")]
         let clock_source = libc::CLOCK_MONOTONIC;
+        // Darwin RAW uses mach_continuous_time: monotonic, not wall-clock
+        // adjustable, and counts sleep. UPTIME_RAW instead uses absolute_time.
+        // https://github.com/apple-oss-distributions/Libc/blob/main/gen/clock_gettime.c
+        #[cfg(target_os = "macos")]
+        let clock_source = libc::CLOCK_MONOTONIC_RAW;
 
         let mut spec = MaybeUninit::<libc::timespec>::uninit();
         // SAFETY: valid pointer is passed to clock_gettime
@@ -177,6 +186,25 @@ impl ProcessCreateTime {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn timestamp_clock_matches_continuous_time() {
+        fn continuous() -> SystemTime {
+            let mut value = MaybeUninit::<libc::timespec>::uninit();
+            assert_eq!(
+                // SAFETY: value is writable timespec storage.
+                unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC_RAW, value.as_mut_ptr()) },
+                0
+            );
+            // SAFETY: the successful call initialized value.
+            unsafe { value.assume_init() }.into()
+        }
+        let before = continuous();
+        let now = SystemTime::now().unwrap();
+        let after = continuous();
+        assert!(before <= now && now <= after);
+    }
 
     #[test]
     fn test_new_system_time() {
