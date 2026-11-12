@@ -6,9 +6,13 @@ PAM_VARIANT = $$(./util/get-pam-variant.bash)
 MSGFMT ?= msgfmt
 LOCALEDIR ?= /usr/share/locale
 
-.PHONY: all clean install-mo pam-sys pam-sys-diff
+.PHONY: all clean install-mo pam-sys pam-sys-diff pam-abi-check
+
+pam-abi-check:
+	./util/check-pam-abi.sh
 
 pam-sys-diff:
+	@./util/get-pam-variant.bash >/dev/null
 	@$(BINDGEN_CMD) $(PAM_SRC_DIR)/wrapper.h | \
 		sed 's/rust-bindgen [0-9]*\.[0-9]*\.[0-9]*/&, minified by cargo-minify/' | \
 		diff --color=auto $(PAM_SRC_DIR)/sys_$(PAM_VARIANT).rs - \
@@ -17,6 +21,7 @@ pam-sys-diff:
 
 # use 'make pam-sys' to re-generate the sys.rs file for your local platform
 pam-sys:
+	@./util/get-pam-variant.bash >/dev/null
 	$(BINDGEN_CMD) $(PAM_SRC_DIR)/wrapper.h --output $(PAM_SRC_DIR)/sys_$(PAM_VARIANT).rs
 	cargo minify --apply --allow-dirty
 	sed -i.bak 's/rust-bindgen [0-9]*\.[0-9]*\.[0-9]*/&, minified by cargo-minify/' $(PAM_SRC_DIR)/sys_$(PAM_VARIANT).rs
