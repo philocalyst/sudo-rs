@@ -352,11 +352,28 @@ fn open_at(parent: BorrowedFd, file_name: &CStr, create: bool) -> io::Result<Own
     }
 }
 
-#[cfg(not(test))]
-#[cfg(any(target_os = "linux", target_os = "freebsd"))]
+#[cfg(any(not(test), target_os = "netbsd", target_os = "macos"))]
 fn faccess_at(parent: BorrowedFd, path: &CStr, mode: c_int, flags: c_int) -> io::Result<()> {
     // SAFETY: by design, a correct CStr pointer is passed to faccessat
     cerr(unsafe { libc::faccessat(parent.as_raw_fd(), path.as_ptr(), mode, flags) }).map(|_| ())
+}
+
+// On platforms without AT_EMPTY_PATH, directories can be queried through ".".
+// Final files are queried relative to the already checked, non-writable parent.
+#[cfg(any(target_os = "netbsd", target_os = "macos"))]
+fn user_can_modify_at(parent: BorrowedFd, path: &CStr) -> io::Result<bool> {
+    match faccess_at(parent, path, libc::W_OK, libc::AT_SYMLINK_NOFOLLOW) {
+        Ok(()) => Ok(true),
+        Err(error)
+            if matches!(
+                error.raw_os_error(),
+                Some(libc::EACCES | libc::EPERM | libc::EROFS)
+            ) =>
+        {
+            Ok(false)
+        }
+        Err(error) => Err(error),
+    }
 }
 
 /// This opens a file for sudoedit, performing security checks (see below) and
@@ -408,7 +425,7 @@ fn traversed_secure_open(
         ));
     }
 
-    let user_cannot_write = |file: &File| -> io::Result<()> {
+    let user_cannot_write = |file: &File, _parent: BorrowedFd, _name: &CStr| -> io::Result<()> {
         let meta = file.metadata()?;
         let perms = meta.permissions().mode();
 
@@ -429,13 +446,22 @@ fn traversed_secure_open(
             // real user id rather than the effective user id.
             let writable = faccess_at(file.as_fd(), c"", libc::W_OK, libc::AT_EMPTY_PATH).is_ok();
 
-            #[cfg(any(test, target_os = "netbsd", target_os = "macos"))]
+            #[cfg(all(not(test), any(target_os = "netbsd", target_os = "macos")))]
+            let writable = if meta.is_dir() {
+                user_can_modify_at(file.as_fd(), c".")?
+            } else {
+                // The invoking user cannot rename entries in any ancestor: each
+                // has already passed the descriptor-based directory check.
+                user_can_modify_at(_parent, _name)?
+            };
+
+            #[cfg(test)]
             let writable = false;
 
             // During testing we do a less comprehensive check as we don't have
             // permission to set the real user id to arbitrary users, but faccessat
             // looks at the real user id.
-            // Also use this as a fallback on platforms that do not have faccessat.
+            // Keep the mode-bit check conservative even when the kernel denies access.
             writable
                 || perms & mode(Category::World, Op::Write) != 0
                 || (perms & mode(Category::Group, Op::Write) != 0)
@@ -455,7 +481,7 @@ fn traversed_secure_open(
     };
 
     let mut cur = File::open("/")?;
-    user_cannot_write(&cur)?;
+    user_cannot_write(&cur, cur.as_fd(), c".")?;
 
     for component in components {
         let dir: CString = match component {
@@ -474,15 +500,15 @@ fn traversed_secure_open(
             cur = open_at(cur.as_fd(), &dir, false)?.into();
             io::Result::Ok(())
         })??;
-        user_cannot_write(&cur)?;
+        user_cannot_write(&cur, cur.as_fd(), c".")?;
     }
-    sudo_call(target_user, target_group, || {
-        cur = open_at(cur.as_fd(), &CString::new(file_name.as_bytes())?, true)?.into();
-        io::Result::Ok(())
+    let name = CString::new(file_name.as_bytes())?;
+    let file: File = sudo_call(target_user, target_group, || {
+        open_at(cur.as_fd(), &name, true).map(File::from)
     })??;
-    user_cannot_write(&cur)?;
+    user_cannot_write(&file, cur.as_fd(), &name)?;
 
-    Ok(cur)
+    Ok(file)
 }
 
 #[cfg(test)]
