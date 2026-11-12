@@ -23,14 +23,17 @@ pub(crate) use env::environment::PATH_DEFAULT;
 mod pam;
 mod pipeline;
 
-#[cfg_attr(not(feature = "dev"), allow(dead_code))]
+#[cfg_attr(
+    not(any(feature = "dev", target_os = "netbsd", target_os = "macos")),
+    allow(dead_code)
+)]
 fn unstable_warning() {
     let check_var = std::env::var("SUDO_RS_IS_UNSTABLE").unwrap_or_default();
 
     if check_var != "I accept that my system may break unexpectedly" {
         eprintln_ignore_io_error!(
             "WARNING!
-Sudo-rs is compiled with development logs on, which means it is less secure and could potentially
+Sudo-rs is a development build or is running on an experimental platform and could potentially
 break your system. We recommend that you do not run this on any production environment.
 To turn off this warning and use sudo-rs you need to set the environment variable
 SUDO_RS_IS_UNSTABLE to the value `I accept that my system may break unexpectedly`."
@@ -80,46 +83,56 @@ fn sudo_process() -> Result<(), Error> {
 
     // parse cli options
     match SudoAction::from_env() {
-        Ok(action) => match action {
-            SudoAction::Help(_) => {
-                println_ignore_io_error!("{}", long_help());
-                std::process::exit(0);
-            }
-            SudoAction::Version(_) => {
-                println_ignore_io_error!("sudo-rs {VERSION}");
-                std::process::exit(0);
-            }
-            SudoAction::RemoveTimestamp(_) => {
-                let user = CurrentUser::resolve()?;
-                let mut record_file = SessionRecordFile::open_for_user(&user, Duration::default())?;
-                record_file.reset()?;
-                Ok(())
-            }
-            SudoAction::ResetTimestamp(_) => {
-                let user = CurrentUser::resolve()?;
-                let process = Process::new();
-                for record_scope in [RecordScope::for_tty, RecordScope::for_ppid] {
-                    if let Some(scope) = record_scope(&process) {
-                        let mut record_file =
-                            SessionRecordFile::open_for_user(&user, Duration::default())?;
-                        record_file.disable(scope)?;
-                    }
-                }
-                Ok(())
-            }
-            SudoAction::Validate(options) => pipeline::run_validate(options),
-            SudoAction::Run(options) => {
-                #[cfg(feature = "dev")]
+        Ok(action) => {
+            #[cfg(any(target_os = "netbsd", target_os = "macos"))]
+            if !matches!(action, SudoAction::Help(_) | SudoAction::Version(_)) {
                 unstable_warning();
-
-                // SudoAction::from_env() should already ensure this
-                assert!(!options.positional_args.is_empty() || options.shell || options.login);
-
-                pipeline::run(options)
             }
-            SudoAction::List(options) => pipeline::run_list(options),
-            SudoAction::Edit(options) => pipeline::run_edit(options),
-        },
+            match action {
+                SudoAction::Help(_) => {
+                    println_ignore_io_error!("{}", long_help());
+                    std::process::exit(0);
+                }
+                SudoAction::Version(_) => {
+                    println_ignore_io_error!("sudo-rs {VERSION}");
+                    std::process::exit(0);
+                }
+                SudoAction::RemoveTimestamp(_) => {
+                    let user = CurrentUser::resolve()?;
+                    let mut record_file =
+                        SessionRecordFile::open_for_user(&user, Duration::default())?;
+                    record_file.reset()?;
+                    Ok(())
+                }
+                SudoAction::ResetTimestamp(_) => {
+                    let user = CurrentUser::resolve()?;
+                    let process = Process::new();
+                    for record_scope in [RecordScope::for_tty, RecordScope::for_ppid] {
+                        if let Some(scope) = record_scope(&process) {
+                            let mut record_file =
+                                SessionRecordFile::open_for_user(&user, Duration::default())?;
+                            record_file.disable(scope)?;
+                        }
+                    }
+                    Ok(())
+                }
+                SudoAction::Validate(options) => pipeline::run_validate(options),
+                SudoAction::Run(options) => {
+                    #[cfg(all(
+                        feature = "dev",
+                        not(any(target_os = "netbsd", target_os = "macos"))
+                    ))]
+                    unstable_warning();
+
+                    // SudoAction::from_env() should already ensure this
+                    assert!(!options.positional_args.is_empty() || options.shell || options.login);
+
+                    pipeline::run(options)
+                }
+                SudoAction::List(options) => pipeline::run_list(options),
+                SudoAction::Edit(options) => pipeline::run_edit(options),
+            }
+        }
         Err(e) => {
             eprintln_ignore_io_error!("{e}\n{}", usage_msg);
             std::process::exit(1);
