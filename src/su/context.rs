@@ -20,8 +20,18 @@ const VALID_LOGIN_SHELLS_LIST: &str = "/etc/shells";
 const FALLBACK_LOGIN_SHELL: &str = "/bin/sh";
 
 // TODO: use _PATH_STDPATH and _PATH_DEFPATH_ROOT from paths.h
+#[cfg(any(target_os = "linux", target_os = "freebsd", target_os = "netbsd"))]
 const PATH_DEFAULT: &str = "/usr/local/bin:/usr/bin:/bin:/usr/local/games:/usr/games";
+#[cfg(any(target_os = "linux", target_os = "freebsd", target_os = "netbsd"))]
 const PATH_DEFAULT_ROOT: &str = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
+
+// Apple su sets the same initial login PATH for root and ordinary users.
+// The login shell may subsequently replace it through its startup files.
+// https://github.com/apple-oss-distributions/shell_cmds/blob/main/su/su.c
+#[cfg(target_os = "macos")]
+const PATH_DEFAULT: &str = "/bin:/usr/bin";
+#[cfg(target_os = "macos")]
+const PATH_DEFAULT_ROOT: &str = PATH_DEFAULT;
 
 #[derive(Debug)]
 pub(crate) struct SuContext {
