@@ -65,7 +65,21 @@ impl CurrentUser {
     pub fn resolve() -> Result<Self, Error> {
         let mut cur_user = User::real()?.ok_or(Error::UserNotFound("current user".to_string()))?;
         // the current user can also have groups that are defined at runtime, so fetch the dynamic groups
-        cur_user.groups = User::real_groups()?;
+        #[cfg(any(target_os = "linux", target_os = "freebsd", target_os = "netbsd"))]
+        {
+            cur_user.groups = User::real_groups()?;
+        }
+        #[cfg(target_os = "macos")]
+        {
+            // getgroups exposes only the 16-entry kernel cache. Keep account
+            // memberships for policy (including negated group rules), plus any
+            // groups installed dynamically in the invoking process.
+            for group in User::real_groups()? {
+                if !cur_user.groups.contains(&group) {
+                    cur_user.groups.push(group);
+                }
+            }
+        }
         Ok(Self { inner: cur_user })
     }
 }

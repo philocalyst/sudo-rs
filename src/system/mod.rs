@@ -28,6 +28,7 @@ pub(crate) mod audit;
 pub mod interface;
 
 pub mod file;
+mod group_credentials;
 
 pub mod time;
 
@@ -326,12 +327,14 @@ fn checked_group_count(count: usize, limit: usize) -> io::Result<c_int> {
 /// set target user and groups (uid, gid, additional groups) for a command
 pub fn set_target_user(
     cmd: &mut std::process::Command,
-    mut target_user: User,
+    target_user: User,
     target_group: Group,
+    explicit_groups: Option<&[GroupId]>,
 ) {
     use std::os::unix::process::CommandExt;
 
-    inject_group(target_group.gid, &mut target_user.groups);
+    let groups =
+        group_credentials::Groups::prepare(&target_user, target_group.gid, explicit_groups);
 
     // we need to do this in a `pre_exec` call since the `groups` method in `process::Command` is unstable
     // see https://github.com/rust-lang/rust/blob/a01b4cc9f375f1b95fa8195daeea938d3d9c4c34/library/std/src/sys/unix/process/process_unix.rs#L329-L352
@@ -339,7 +342,7 @@ pub fn set_target_user(
     // SAFETY: Setuid, setgid and setgroups are async-signal-safe.
     unsafe {
         cmd.pre_exec(move || {
-            set_supplementary_groups(&target_user.groups)?;
+            groups.install()?;
             // setgid and setuid set the real, effective and saved version of the gid and uid
             // respectively rather than just the real gid and uid. The original sudo uses setresgid
             // and setresuid instead with all three arguments equal, but as this does the same as
