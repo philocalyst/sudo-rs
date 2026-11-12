@@ -1,6 +1,8 @@
 #![cfg_attr(not(feature = "unstable-remote-sudoers"), allow(unused_imports))]
 use std::collections::HashSet;
-use std::ffi::{CStr, CString, c_int, c_uint};
+#[cfg(any(target_os = "linux", target_os = "freebsd"))]
+use std::ffi::c_int;
+use std::ffi::{CStr, CString, c_uint};
 use std::fs::{self, DirBuilder, File, Metadata, OpenOptions};
 use std::io::{self, BufReader, Error, ErrorKind};
 use std::net::Shutdown;
@@ -103,9 +105,9 @@ pub(crate) fn sudo_call<T>(
     Ok(result)
 }
 
-#[cfg(feature = "unstable-remote-sudoers")]
+#[cfg(all(feature = "unstable-remote-sudoers", target_os = "linux"))]
 /// Get the credentials of the peer at the other side of the socket
-fn get_peer_credentials(stream: &UnixStream) -> io::Result<libc::ucred> {
+fn get_peer_credentials(stream: &UnixStream) -> io::Result<(UserId, GroupId)> {
     let mut ucred = libc::ucred {
         pid: 0,
         uid: 0,
@@ -125,7 +127,21 @@ fn get_peer_credentials(stream: &UnixStream) -> io::Result<libc::ucred> {
         ))?;
     }
 
-    Ok(ucred)
+    Ok((UserId::new(ucred.uid), GroupId::new(ucred.gid)))
+}
+
+#[cfg(all(
+    feature = "unstable-remote-sudoers",
+    any(target_os = "freebsd", target_os = "netbsd", target_os = "macos")
+))]
+fn get_peer_credentials(stream: &UnixStream) -> io::Result<(UserId, GroupId)> {
+    let (mut uid, mut gid) = (0, 0);
+    // getpeereid returns the effective credentials saved when the connection
+    // was established, rather than trusting the socket's pathname ownership.
+    // https://man.netbsd.org/getpeereid.3
+    // SAFETY: stream is live and both output pointers are valid.
+    cerr(unsafe { libc::getpeereid(stream.as_raw_fd(), &mut uid, &mut gid) })?;
+    Ok((UserId::new(uid), GroupId::new(gid)))
 }
 
 /// Drop root privileges by setting effective user id equal to the real user id.
@@ -313,13 +329,13 @@ fn secure_open_socket_impl(
     let stream = UnixStream::connect(path)?;
 
     // Check the peer's credentials to avoid the TOCTOU.
-    let peer_creds = get_peer_credentials(&stream)?;
+    let (peer_uid, peer_gid) = get_peer_credentials(&stream)?;
 
     // If there is an error in these checks, the function returns immediately
     // leaving `stream` out of scope and forcing the closing of the socket.
-    check_peer(UserId::new(peer_creds.uid), user, "user")?;
+    check_peer(peer_uid, user, "user")?;
     if let Some(group) = group {
-        check_peer(GroupId::new(peer_creds.gid), group, "group")?;
+        check_peer(peer_gid, group, "group")?;
     }
 
     stream.shutdown(Shutdown::Write)?;
@@ -563,5 +579,28 @@ mod test {
         if file.metadata().is_ok_and(|meta| meta.len() == 0) {
             std::fs::remove_file(path).unwrap();
         }
+    }
+}
+
+#[cfg(all(test, feature = "unstable-remote-sudoers"))]
+mod peer_tests {
+    use super::*;
+
+    #[test]
+    fn connected_socket_reports_effective_credentials() {
+        let (stream, _peer) = UnixStream::pair().unwrap();
+        // SAFETY: these queries have no preconditions.
+        let expected = unsafe { (UserId::new(libc::geteuid()), GroupId::new(libc::getegid())) };
+        assert_eq!(get_peer_credentials(&stream).unwrap(), expected);
+    }
+
+    #[test]
+    fn regular_file_cannot_supply_peer_credentials() {
+        let fd: OwnedFd = File::open("/dev/null").unwrap().into();
+        let stream = UnixStream::from(fd);
+        assert_eq!(
+            get_peer_credentials(&stream).unwrap_err().raw_os_error(),
+            Some(libc::ENOTSOCK)
+        );
     }
 }
