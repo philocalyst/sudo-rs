@@ -336,10 +336,7 @@ jobs:
         run: sudo -ubuilder cargo build --workspace --all-targets --release
 
       - name: Run tests
-        run: |
-          # Alpine hasn't done usr-merge yet
-          sudo -ubuilder cargo test --workspace --all-targets --release \
-            -- --skip canonicalization --skip test_build_run_context
+        run: sudo -ubuilder cargo test --workspace --all-targets --release
 
   build-and-test-32bit:
     runs-on: ubuntu-latest
