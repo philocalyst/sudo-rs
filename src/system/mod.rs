@@ -2,7 +2,7 @@
 use std::str::FromStr;
 use std::{
     ffi::{CStr, c_int, c_long},
-    fmt, fs, io,
+    fmt, io,
     mem::MaybeUninit,
     ops,
     os::unix,
@@ -95,11 +95,39 @@ pub(crate) fn mark_fds_as_cloexec() -> io::Result<()> {
     mark_fds_as_cloexec_fallback(STDERR_FILENO + 1)
 }
 
+#[cfg(target_os = "netbsd")]
+fn mark_fds_as_cloexec_fallback(lowfd: i32) -> io::Result<()> {
+    // F_MAXFD returns the highest open descriptor, also above a lowered
+    // RLIMIT_NOFILE, and needs no procfs. NetBSD's procfs only lists the
+    // descriptors below that limit once a listing needs a second getdents call.
+    // https://github.com/NetBSD/src/blob/netbsd-10/sys/kern/sys_descrip.c#L374-L376
+    // https://github.com/NetBSD/src/blob/netbsd-10/sys/miscfs/procfs/procfs_vnops.c#L1352-L1356
+    set_errno(0);
+    // SAFETY: F_MAXFD ignores the descriptor argument and takes no pointer.
+    let highest = unsafe { libc::fcntl(0, libc::F_MAXFD) };
+    // An empty descriptor table also returns -1, without setting errno.
+    if highest == -1 && io::Error::last_os_error().raw_os_error() != Some(0) {
+        return Err(io::Error::last_os_error());
+    }
+    for fd in lowfd..=highest {
+        // SAFETY: this changes only the descriptor's close-on-exec flag.
+        match cerr(unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) }) {
+            // Gaps in the descriptor table are expected.
+            Err(err) if err.raw_os_error() == Some(libc::EBADF) => (),
+            result => {
+                result?;
+            }
+        }
+    }
+    Ok(())
+}
+
+#[cfg(not(target_os = "netbsd"))]
 fn mark_fds_as_cloexec_fallback(lowfd: i32) -> io::Result<()> {
     // If the kernel doesn't support close_range or CLOSE_RANGE_CLOEXEC,
     // fallback to finding all open fds using /proc/self/fd or /dev/fd
 
-    for entry in fs::read_dir(if cfg!(any(target_os = "linux", target_os = "netbsd")) {
+    for entry in std::fs::read_dir(if cfg!(target_os = "linux") {
         "/proc/self/fd"
     } else {
         "/dev/fd"
