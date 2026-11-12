@@ -326,7 +326,9 @@ mod tests {
 
         let path = PathBuf::from(OsString::from_vec(pty.path.into_bytes()));
         assert!(path.try_exists().unwrap());
-        assert!(path.starts_with("/dev/pts/"));
+        // The path must name the follower device (it is what gets chowned to the user); how
+        // those are named differs per OS, e.g. /dev/pts/N on Linux, /dev/ttysNNN on macOS.
+        assert_eq!(pty.follower.ttyname().unwrap(), path.as_os_str());
     }
 
     #[test]
