@@ -766,56 +766,54 @@ impl Process {
         use std::ffi::c_void;
         use std::ptr;
 
-        let mut ki_proc: Vec<KinfoProc> = Vec::with_capacity(1);
-
+        let mut ki_proc = MaybeUninit::<KinfoProc>::uninit();
         let pid = match pid {
             WithProcess::Current => std::process::id() as i32,
             WithProcess::Other(pid) => pid.inner(),
         };
-
-        loop {
-            let mut size = ki_proc.capacity() * size_of::<KinfoProc>();
-            // SAFETY: KERN_PROC_PID only reads data into the ki_proc list. It
-            // does not write more than `size` bytes to the pointer.
-            match cerr(unsafe {
-                libc::sysctl(
-                    [
-                        libc::CTL_KERN,
-                        #[cfg(target_os = "freebsd")]
-                        libc::KERN_PROC,
-                        #[cfg(target_os = "netbsd")]
-                        libc::KERN_PROC2,
-                        libc::KERN_PROC_PID,
-                        pid,
-                        size_of::<KinfoProc>() as i32,
-                        1,
-                    ]
-                    .as_ptr(),
-                    if cfg!(target_os = "freebsd") { 4 } else { 6 },
-                    ki_proc.as_mut_ptr().cast::<c_void>(),
-                    &mut size,
-                    ptr::null(),
-                    0,
-                )
-            }) {
-                Ok(_) => {
-                    assert!(size >= size_of::<KinfoProc>());
-                    // SAFETY: The above sysctl has initialized at least `size` bytes. We have
-                    // asserted that this is at least a single element.
-                    unsafe {
-                        ki_proc.set_len(1);
-                    }
-                    break;
-                }
-                Err(e) if e.raw_os_error() == Some(libc::ENOMEM) => {
-                    // Vector not big enough. Grow it by 10% and try again.
-                    ki_proc.reserve(ki_proc.capacity() + ki_proc.capacity().div_ceil(10));
-                }
-                Err(e) => return Err(e),
-            }
+        let mut size = size_of::<KinfoProc>();
+        // SAFETY: the output buffer has the advertised size; the MIB selects one PID.
+        cerr(unsafe {
+            libc::sysctl(
+                [
+                    libc::CTL_KERN,
+                    #[cfg(target_os = "freebsd")]
+                    libc::KERN_PROC,
+                    #[cfg(target_os = "netbsd")]
+                    libc::KERN_PROC2,
+                    libc::KERN_PROC_PID,
+                    pid,
+                    size_of::<KinfoProc>() as i32,
+                    1,
+                ]
+                .as_ptr(),
+                if cfg!(target_os = "freebsd") { 4 } else { 6 },
+                ki_proc.as_mut_ptr().cast::<c_void>(),
+                &mut size,
+                ptr::null(),
+                0,
+            )
+        })?;
+        // A disappearing or invisible process can yield an empty result. Never
+        // construct an identity from a partial structure or panic on kernel output.
+        if size == 0 {
+            return Err(io::Error::from_raw_os_error(libc::ESRCH));
         }
-
-        Ok(ki_proc[0])
+        if size != size_of::<KinfoProc>() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "incomplete process information",
+            ));
+        }
+        // SAFETY: sysctl succeeded and returned exactly one complete structure.
+        let info = unsafe { ki_proc.assume_init() };
+        #[cfg(target_os = "netbsd")]
+        if info.p_uvalid == 0 {
+            // fill_kproc2 omits start-time data for zombies; zero is not an identity.
+            // https://github.com/NetBSD/src/blob/netbsd-10/sys/kern/kern_proc.c
+            return Err(io::Error::from_raw_os_error(libc::ESRCH));
+        }
+        Ok(info)
     }
 
     /// Returns the device identifier of the TTY device that is currently
@@ -827,12 +825,16 @@ impl Process {
         #[cfg(target_os = "freebsd")]
         let dev_nr = ki_proc.ki_tdev;
         #[cfg(target_os = "netbsd")]
-        let dev_nr = ki_proc.p_tdev.into();
+        // NetBSD exports NODEV through a uint32_t, although dev_t is u64.
+        // https://github.com/NetBSD/src/blob/netbsd-10/sys/kern/kern_proc.c
+        let dev_nr = ki_proc.p_tdev;
 
         if dev_nr == !0 {
             Ok(None)
         } else {
-            Ok(Some(DeviceId::new(dev_nr)))
+            #[allow(clippy::useless_conversion)] // NetBSD exports u32, FreeBSD u64.
+            let dev = DeviceId::new(dev_nr.into());
+            Ok(Some(dev))
         }
     }
 
