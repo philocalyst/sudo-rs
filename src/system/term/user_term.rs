@@ -10,6 +10,8 @@ use std::{
     sync::atomic::{AtomicBool, Ordering},
 };
 
+#[cfg(target_os = "linux")]
+use libc::OLCUC;
 use libc::{
     CS7, CS8, ECHO, ECHOCTL, ECHOE, ECHOK, ECHOKE, ECHONL, ICANON, ICRNL, IEXTEN, IGNCR, IGNPAR,
     IMAXBEL, INLCR, INPCK, ISIG, ISTRIP, IXANY, IXOFF, IXON, NOFLSH, OCRNL, ONLCR, ONLRET, ONOCR,
@@ -18,10 +20,11 @@ use libc::{
     sigemptyset, sighandler_t, siginfo_t, sigset_t, tcflag_t, tcgetattr, tcsetattr, termios,
     winsize,
 };
-#[cfg(target_os = "linux")]
-use libc::{IUTF8, OLCUC};
+// Darwin exposes IUTF8 for UTF-8 erase handling (sys/termios.h).
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+use libc::IUTF8;
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(any(target_os = "freebsd", target_os = "netbsd"))]
 const IUTF8: libc::tcflag_t = 0;
 #[cfg(not(target_os = "linux"))]
 const OLCUC: libc::tcflag_t = 0;
@@ -315,5 +318,50 @@ impl Write for UserTerm {
 
     fn flush(&mut self) -> io::Result<()> {
         self.tty.flush()
+    }
+}
+
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+mod tests {
+    use super::*;
+    use crate::system::term::Pty;
+
+    #[test]
+    fn copy_terminal_settings_copies_utf8_erase_flag() {
+        let source = Pty::open().unwrap();
+        let destination = Pty::open().unwrap();
+        let user = UserTerm {
+            tty: File::from(source.follower.as_fd().try_clone_to_owned().unwrap()),
+            original_termios: None,
+        };
+        let read = |fd| {
+            let mut value = MaybeUninit::<termios>::uninit();
+            // SAFETY: value is writable and checked before use.
+            assert_eq!(unsafe { tcgetattr(fd, value.as_mut_ptr()) }, 0);
+            // SAFETY: successful tcgetattr initialized value.
+            unsafe { value.assume_init() }
+        };
+        for enabled in [true, false] {
+            let mut value = read(user.tty.as_raw_fd());
+            if enabled {
+                value.c_iflag |= libc::IUTF8;
+            } else {
+                value.c_iflag &= !libc::IUTF8;
+            }
+            assert_eq!(
+                // SAFETY: initialized terminal settings and a live descriptor.
+                unsafe { tcsetattr(user.tty.as_raw_fd(), libc::TCSANOW, &value) },
+                0
+            );
+            assert_eq!(
+                read(user.tty.as_raw_fd()).c_iflag & libc::IUTF8 != 0,
+                enabled
+            );
+            user.copy_to(&destination.follower).unwrap();
+            assert_eq!(
+                read(destination.follower.as_fd().as_raw_fd()).c_iflag & libc::IUTF8 != 0,
+                enabled
+            );
+        }
     }
 }
