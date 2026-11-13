@@ -352,11 +352,59 @@ fn open_at(parent: BorrowedFd, file_name: &CStr, create: bool) -> io::Result<Own
     }
 }
 
-#[cfg(not(test))]
-#[cfg(any(target_os = "linux", target_os = "freebsd"))]
+#[cfg(any(not(test), target_os = "netbsd", target_os = "macos"))]
 fn faccess_at(parent: BorrowedFd, path: &CStr, mode: c_int, flags: c_int) -> io::Result<()> {
     // SAFETY: by design, a correct CStr pointer is passed to faccessat
     cerr(unsafe { libc::faccessat(parent.as_raw_fd(), path.as_ptr(), mode, flags) }).map(|_| ())
+}
+
+// These platforms have no AT_EMPTY_PATH: a directory is asked about as ".", other
+// files by their name in the directory they were opened from.
+#[cfg(any(target_os = "netbsd", target_os = "macos"))]
+fn user_can_modify_at(parent: BorrowedFd, path: &CStr) -> io::Result<bool> {
+    #[cfg(target_os = "netbsd")]
+    const RIGHTS: &[c_int] = &[libc::W_OK];
+    // W_OK only holds if all the rights needed to write are granted, which for a
+    // directory means both adding files and adding subdirectories; an access control
+    // list can grant either one, or the right to delete entries or the object. So ask
+    // about each right that changes the object, using the extended access bits from
+    // <sys/unistd.h>, each of which faccessat checks as exactly one right, see
+    // https://github.com/apple-oss-distributions/xnu/blob/xnu-11215.81.4/bsd/vfs/vfs_syscalls.c#L6621-L6643
+    #[cfg(target_os = "macos")]
+    const RIGHTS: &[c_int] = &[
+        1 << 10, // _WRITE_OK: write data, or add a file to a directory
+        1 << 12, // _DELETE_OK: delete it
+        1 << 13, // _APPEND_OK: append data, or add a subdirectory to a directory
+        1 << 14, // _RMFILE_OK: delete an entry from a directory
+        1 << 20, // _WPERM_OK: change the permissions, which can grant all of the above
+        1 << 21, // _CHOWN_OK: change the ownership
+    ];
+    for &right in RIGHTS {
+        if access_allowed(faccess_at(parent, path, right, libc::AT_SYMLINK_NOFOLLOW))? {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+// As in original sudo, only these errors mean that the access is withheld: from
+// the user, by an immutable flag, or by a read-only file system. Any other error
+// leaves the question open, so it is passed on instead of read as a no.
+// https://github.com/sudo-project/sudo/blob/v1.9.17p2/src/edit_open.c#L192-L206
+#[cfg(any(target_os = "netbsd", target_os = "macos"))]
+fn access_allowed(result: io::Result<()>) -> io::Result<bool> {
+    match result {
+        Ok(()) => Ok(true),
+        Err(error)
+            if matches!(
+                error.raw_os_error(),
+                Some(libc::EACCES | libc::EPERM | libc::EROFS)
+            ) =>
+        {
+            Ok(false)
+        }
+        Err(error) => Err(error),
+    }
 }
 
 /// This opens a file for sudoedit, performing security checks (see below) and
@@ -408,7 +456,7 @@ fn traversed_secure_open(
         ));
     }
 
-    let user_cannot_write = |file: &File| -> io::Result<()> {
+    let user_cannot_write = |file: &File, _parent: BorrowedFd, _name: &CStr| -> io::Result<()> {
         let meta = file.metadata()?;
         let perms = meta.permissions().mode();
 
@@ -429,13 +477,22 @@ fn traversed_secure_open(
             // real user id rather than the effective user id.
             let writable = faccess_at(file.as_fd(), c"", libc::W_OK, libc::AT_EMPTY_PATH).is_ok();
 
-            #[cfg(any(test, target_os = "netbsd", target_os = "macos"))]
+            #[cfg(all(not(test), any(target_os = "netbsd", target_os = "macos")))]
+            let writable = if meta.is_dir() {
+                user_can_modify_at(file.as_fd(), c".")?
+            } else {
+                // The invoking user cannot rename entries in any ancestor: each
+                // has already passed the descriptor-based directory check.
+                user_can_modify_at(_parent, _name)?
+            };
+
+            #[cfg(test)]
             let writable = false;
 
             // During testing we do a less comprehensive check as we don't have
             // permission to set the real user id to arbitrary users, but faccessat
             // looks at the real user id.
-            // Also use this as a fallback on platforms that do not have faccessat.
+            // Keep the mode-bit check conservative even when the kernel denies access.
             writable
                 || perms & mode(Category::World, Op::Write) != 0
                 || (perms & mode(Category::Group, Op::Write) != 0)
@@ -455,7 +512,7 @@ fn traversed_secure_open(
     };
 
     let mut cur = File::open("/")?;
-    user_cannot_write(&cur)?;
+    user_cannot_write(&cur, cur.as_fd(), c".")?;
 
     for component in components {
         let dir: CString = match component {
@@ -474,20 +531,124 @@ fn traversed_secure_open(
             cur = open_at(cur.as_fd(), &dir, false)?.into();
             io::Result::Ok(())
         })??;
-        user_cannot_write(&cur)?;
+        user_cannot_write(&cur, cur.as_fd(), c".")?;
     }
-    sudo_call(target_user, target_group, || {
-        cur = open_at(cur.as_fd(), &CString::new(file_name.as_bytes())?, true)?.into();
-        io::Result::Ok(())
+    let name = CString::new(file_name.as_bytes())?;
+    let file: File = sudo_call(target_user, target_group, || {
+        open_at(cur.as_fd(), &name, true).map(File::from)
     })??;
-    user_cannot_write(&cur)?;
+    user_cannot_write(&file, cur.as_fd(), &name)?;
 
-    Ok(cur)
+    Ok(file)
 }
 
 #[cfg(test)]
 mod test {
     use super::*;
+
+    #[cfg(any(target_os = "netbsd", target_os = "macos"))]
+    #[test]
+    fn unexpected_access_errors_are_not_read_as_no() {
+        assert!(access_allowed(Ok(())).unwrap());
+        for code in [libc::EACCES, libc::EPERM, libc::EROFS] {
+            assert!(!access_allowed(Err(Error::from_raw_os_error(code))).unwrap());
+        }
+        for code in [libc::ENOENT, libc::EBADF, libc::EINVAL, libc::EIO] {
+            let error = access_allowed(Err(Error::from_raw_os_error(code))).unwrap_err();
+            assert_eq!(error.raw_os_error(), Some(code));
+        }
+        // a path the kernel cannot resolve is an error, never proof that it is safe
+        let root = File::open("/").unwrap();
+        let error = user_can_modify_at(root.as_fd(), c"dev/null/not-a-directory").unwrap_err();
+        assert_eq!(error.raw_os_error(), Some(libc::ENOTDIR));
+    }
+
+    // this test is allowed to fail if run as root -- do not run unit tests as root
+    #[cfg(any(target_os = "netbsd", target_os = "macos"))]
+    #[test]
+    fn user_can_modify_at_asks_about_directories_and_files() {
+        let dir = crate::system::file::create_temporary_dir().unwrap();
+        fs::write(dir.join("file"), "").unwrap();
+        let dir_fd = File::open(&dir).unwrap();
+        // a directory is asked about through ".", a file through its directory
+        let own_dir = user_can_modify_at(dir_fd.as_fd(), c".");
+        let own_file = user_can_modify_at(dir_fd.as_fd(), c"file");
+        fs::remove_dir_all(&dir).unwrap();
+        assert!(own_dir.unwrap());
+        assert!(own_file.unwrap());
+
+        let root = File::open("/").unwrap();
+        assert!(!user_can_modify_at(root.as_fd(), c".").unwrap());
+    }
+
+    // A file its owner may only append to: W_OK says no, but the user can change it.
+    // (The owner may also change its permissions; a file owned by someone else cannot
+    // be set up without privileges.)
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn append_only_acl_counts_as_modifiable() {
+        use std::io::Write;
+        let dir = crate::system::file::create_temporary_dir().unwrap();
+        let path = dir.join("file");
+        fs::write(&path, "").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o400)).unwrap();
+        let append = || OpenOptions::new().append(true).open(&path)?.write_all(b"x");
+        let before = append();
+        let user = User::real().unwrap().unwrap();
+        let acl = std::process::Command::new("/bin/chmod")
+            .args(["+a", &format!("user:{} allow append", user.name)])
+            .arg(&path)
+            .status();
+        let dir_fd = File::open(&dir).unwrap();
+        let w_ok = faccess_at(
+            dir_fd.as_fd(),
+            c"file",
+            libc::W_OK,
+            libc::AT_SYMLINK_NOFOLLOW,
+        );
+        let modifiable = user_can_modify_at(dir_fd.as_fd(), c"file");
+        let after = append();
+        fs::remove_dir_all(&dir).unwrap();
+
+        assert_eq!(before.unwrap_err().raw_os_error(), Some(libc::EACCES));
+        assert!(acl.unwrap().success());
+        assert_eq!(w_ok.unwrap_err().raw_os_error(), Some(libc::EACCES));
+        after.unwrap();
+        assert!(modifiable.unwrap());
+    }
+
+    // Asking about "." sees a right granted on the directory itself, as the actual
+    // operation does: here the right to delete it.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn dot_query_sees_rights_on_the_directory() {
+        const DELETE: c_int = 1 << 12; // _DELETE_OK
+        let dir = crate::system::file::create_temporary_dir().unwrap();
+        let child = dir.join("child");
+        fs::create_dir(&child).unwrap();
+        let child_fd = File::open(&child).unwrap();
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o500)).unwrap();
+        fs::set_permissions(&child, fs::Permissions::from_mode(0o500)).unwrap();
+        let query = || faccess_at(child_fd.as_fd(), c".", DELETE, libc::AT_SYMLINK_NOFOLLOW);
+        let (asked_before, removed_before) = (query(), fs::remove_dir(&child));
+        let user = User::real().unwrap().unwrap();
+        let acl = std::process::Command::new("/bin/chmod")
+            .args(["+a", &format!("user:{} allow delete", user.name)])
+            .arg(&child)
+            .status();
+        let (asked_after, removed_after) = (query(), fs::remove_dir(&child));
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).unwrap();
+        fs::remove_dir_all(&dir).unwrap();
+
+        assert_eq!(asked_before.unwrap_err().raw_os_error(), Some(libc::EACCES));
+        assert_eq!(
+            removed_before.unwrap_err().raw_os_error(),
+            Some(libc::EACCES)
+        );
+        assert!(acl.unwrap().success());
+        asked_after.unwrap();
+        removed_after.unwrap();
+    }
 
     #[test]
     fn secure_open_is_predictable() {
