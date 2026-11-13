@@ -28,6 +28,7 @@ pub(crate) mod audit;
 pub mod interface;
 
 pub mod file;
+mod group_credentials;
 
 pub mod time;
 
@@ -299,8 +300,11 @@ fn set_supplementary_groups(groups: &[GroupId]) -> io::Result<()> {
 
     // Outside of Linux, setgroups expects the size to be passed as a c_int, so the below
     // conversion protects a very extreme case of arithmetic conversion error
+    #[cfg(any(target_os = "linux", target_os = "freebsd"))]
     #[allow(clippy::useless_conversion)]
     let len = std::cmp::min(groups.len().try_into().unwrap_or(NGROUPS_MAX), NGROUPS_MAX);
+    #[cfg(any(target_os = "netbsd", target_os = "macos"))]
+    let len = checked_group_count(groups.len(), NGROUPS_MAX as usize)?;
 
     // SAFETY: setgroups is passed a valid pointer to a chunk of memory of the correct size
     // We can cast to gid_t because `GroupId` is marked as transparent
@@ -309,15 +313,26 @@ fn set_supplementary_groups(groups: &[GroupId]) -> io::Result<()> {
     Ok(())
 }
 
+#[cfg(any(target_os = "netbsd", target_os = "macos"))]
+fn checked_group_count(count: usize, limit: usize) -> io::Result<c_int> {
+    // Dropping a group can grant access through the file's other permission class.
+    if count > limit {
+        return Err(io::Error::from_raw_os_error(libc::EINVAL));
+    }
+    c_int::try_from(count).map_err(|_| io::Error::from_raw_os_error(libc::EINVAL))
+}
+
 /// set target user and groups (uid, gid, additional groups) for a command
 pub fn set_target_user(
     cmd: &mut std::process::Command,
-    mut target_user: User,
+    target_user: User,
     target_group: Group,
+    explicit_groups: Option<&[GroupId]>,
 ) {
     use std::os::unix::process::CommandExt;
 
-    inject_group(target_group.gid, &mut target_user.groups);
+    let groups =
+        group_credentials::Groups::prepare(&target_user, target_group.gid, explicit_groups);
 
     // we need to do this in a `pre_exec` call since the `groups` method in `process::Command` is unstable
     // see https://github.com/rust-lang/rust/blob/a01b4cc9f375f1b95fa8195daeea938d3d9c4c34/library/std/src/sys/unix/process/process_unix.rs#L329-L352
@@ -325,7 +340,7 @@ pub fn set_target_user(
     // SAFETY: Setuid, setgid and setgroups are async-signal-safe.
     unsafe {
         cmd.pre_exec(move || {
-            set_supplementary_groups(&target_user.groups)?;
+            groups.install()?;
             // setgid and setuid set the real, effective and saved version of the gid and uid
             // respectively rather than just the real gid and uid. The original sudo uses setresgid
             // and setresuid instead with all three arguments equal, but as this does the same as
@@ -1087,6 +1102,35 @@ mod tests {
         test("dr. bill", "fidelio", 1999, &["eyes", "wide", "shut"]);
         test("eris", "fnord", 5, &[]);
         test("abc", "password123", 42, &[""]);
+    }
+
+    #[cfg(any(target_os = "netbsd", target_os = "macos"))]
+    #[test]
+    fn explicit_group_lists_are_never_silently_shortened() {
+        for n in [0, 15, 16] {
+            assert_eq!(super::checked_group_count(n, 16).unwrap(), n as i32);
+        }
+        for n in [17, usize::MAX] {
+            assert_eq!(
+                super::checked_group_count(n, 16)
+                    .unwrap_err()
+                    .raw_os_error(),
+                Some(libc::EINVAL)
+            );
+        }
+        let primary = GroupId::new(99);
+        for mut groups in [
+            vec![],
+            vec![primary],
+            vec![GroupId::new(1), primary, primary],
+        ] {
+            let original = groups.clone();
+            super::inject_group(primary, &mut groups);
+            assert_eq!(groups[0], primary);
+            for group in original {
+                assert!(groups.contains(&group));
+            }
+        }
     }
 
     #[test]
