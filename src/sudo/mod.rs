@@ -23,21 +23,9 @@ pub(crate) use env::environment::PATH_DEFAULT;
 mod pam;
 mod pipeline;
 
-#[cfg_attr(not(feature = "dev"), allow(dead_code))]
-fn unstable_warning() {
-    let check_var = std::env::var("SUDO_RS_IS_UNSTABLE").unwrap_or_default();
-
-    if check_var != "I accept that my system may break unexpectedly" {
-        eprintln_ignore_io_error!(
-            "WARNING!
-Sudo-rs is compiled with development logs on, which means it is less secure and could potentially
-break your system. We recommend that you do not run this on any production environment.
-To turn off this warning and use sudo-rs you need to set the environment variable
-SUDO_RS_IS_UNSTABLE to the value `I accept that my system may break unexpectedly`."
-        );
-
-        std::process::exit(1);
-    }
+/// Only showing the help or the version does nothing that needs privileges.
+fn needs_unstable_acknowledgement(action: &SudoAction) -> bool {
+    !matches!(action, SudoAction::Help(_) | SudoAction::Version(_))
 }
 
 const VERSION: &str = if let Some(version_override) = std::option_env!("SUDO_RS_VERSION") {
@@ -79,7 +67,17 @@ fn sudo_process() -> Result<(), Error> {
     }
 
     // parse cli options
-    match SudoAction::from_env() {
+    let action = SudoAction::from_env();
+
+    // Support for NetBSD and macOS is experimental, so there everything but help and version
+    // needs the acknowledgement.
+    if cfg!(any(target_os = "netbsd", target_os = "macos"))
+        && matches!(&action, Ok(action) if needs_unstable_acknowledgement(action))
+    {
+        crate::common::unstable_warning();
+    }
+
+    match action {
         Ok(action) => match action {
             SudoAction::Help(_) => {
                 println_ignore_io_error!("{}", long_help());
@@ -115,7 +113,7 @@ fn sudo_process() -> Result<(), Error> {
                 );
 
                 #[cfg(feature = "dev")]
-                unstable_warning();
+                crate::common::unstable_warning();
 
                 // SudoAction::from_env() should already ensure this
                 assert!(!options.positional_args.is_empty() || options.shell || options.login);
@@ -153,6 +151,30 @@ pub fn main() {
                 diagnostic::diagnostic!("{error}");
             }
             std::process::exit(1);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{SudoAction, needs_unstable_acknowledgement};
+
+    #[test]
+    fn only_help_and_version_go_without_the_unstable_acknowledgement() {
+        let needs = |args: &[&str]| {
+            needs_unstable_acknowledgement(&SudoAction::try_parse_from(args).unwrap())
+        };
+        assert!(!needs(&["sudo", "-h"]));
+        assert!(!needs(&["sudo", "-V"]));
+        for args in [
+            &["sudo", "true"][..],
+            &["sudo", "-e", "/etc/hosts"],
+            &["sudo", "-l"],
+            &["sudo", "-v"],
+            &["sudo", "-k"],
+            &["sudo", "-K"],
+        ] {
+            assert!(needs(args), "{args:?}");
         }
     }
 }

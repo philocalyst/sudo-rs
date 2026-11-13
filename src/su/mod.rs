@@ -112,6 +112,11 @@ fn run(options: SuRunOptions) -> Result<(), Error> {
     match command_exit_reason?.exit_process()? {}
 }
 
+/// Only showing the help or the version does nothing that needs privileges.
+fn needs_unstable_acknowledgement(action: &SuAction) -> bool {
+    !matches!(action, SuAction::Help(_) | SuAction::Version(_))
+}
+
 pub fn main() {
     crate::log::SudoLogger::new("su: ").into_global_logger();
 
@@ -122,6 +127,13 @@ pub fn main() {
             std::process::exit(1);
         }
     };
+
+    // As in sudo: support for NetBSD and macOS is experimental.
+    if cfg!(any(target_os = "netbsd", target_os = "macos"))
+        && needs_unstable_acknowledgement(&action)
+    {
+        crate::common::unstable_warning();
+    }
 
     match action {
         SuAction::Help(_) => {
@@ -148,4 +160,26 @@ pub fn main() {
             _ => {}
         },
     };
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{cli::SuOptions, needs_unstable_acknowledgement};
+
+    #[test]
+    fn only_help_and_version_go_without_the_unstable_acknowledgement() {
+        let needs = |args: &[&str]| {
+            let args = args.iter().map(|arg| arg.to_string());
+            needs_unstable_acknowledgement(
+                &SuOptions::parse_arguments(args)
+                    .unwrap()
+                    .validate()
+                    .unwrap(),
+            )
+        };
+        assert!(!needs(&["su", "--help"]));
+        assert!(!needs(&["su", "--version"]));
+        assert!(needs(&["su"]));
+        assert!(needs(&["su", "-l", "root"]));
+    }
 }
