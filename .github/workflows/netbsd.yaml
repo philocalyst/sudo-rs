@@ -1,0 +1,59 @@
+name: NetBSD
+
+permissions: {}
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+  merge_group:
+    branches:
+      - main
+
+jobs:
+  netbsd:
+    name: NetBSD unit tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Unit tests in a NetBSD VM
+        uses: vmactions/netbsd-vm@5957cf330aef2e6ddc63c604364c99ce2e02b91d # v1.5.3
+        with:
+          release: "10.2"
+          cache-after-prepare: true
+          # system::time::tests::get_process_start_time compares the process
+          # start time against the wall clock, so the guest clock must be sane.
+          sync-time: true
+          prepare: |
+            /usr/sbin/pkg_add rust git-base
+          run: |
+            set -e
+            export PATH=/usr/pkg/bin:$PATH
+            rustc --version
+            cargo --version
+
+            # The unit tests must not run as root, and the VM logs in as root.
+            useradd -m sudorstest
+            chown -R sudorstest .
+            su -m sudorstest -c "cd $PWD && env HOME=/home/sudorstest cargo test --workspace --all-targets --release"
+
+  clippy:
+    name: NetBSD clippy
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - run: rustup target add x86_64-unknown-netbsd
+
+      - name: Run clippy for NetBSD
+        run: cargo clippy --no-deps --all-targets --target x86_64-unknown-netbsd -- --deny warnings
