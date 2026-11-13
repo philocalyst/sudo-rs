@@ -2,7 +2,7 @@
 use std::str::FromStr;
 use std::{
     ffi::{CStr, c_int, c_long},
-    fmt, fs, io,
+    fmt, io,
     mem::MaybeUninit,
     ops,
     os::unix,
@@ -95,11 +95,39 @@ pub(crate) fn mark_fds_as_cloexec() -> io::Result<()> {
     mark_fds_as_cloexec_fallback(STDERR_FILENO + 1)
 }
 
+#[cfg(target_os = "netbsd")]
+fn mark_fds_as_cloexec_fallback(lowfd: i32) -> io::Result<()> {
+    // F_MAXFD returns the highest open descriptor, also above a lowered
+    // RLIMIT_NOFILE, and needs no procfs. NetBSD's procfs only lists the
+    // descriptors below that limit once a listing needs a second getdents call.
+    // https://github.com/NetBSD/src/blob/netbsd-10/sys/kern/sys_descrip.c#L374-L376
+    // https://github.com/NetBSD/src/blob/netbsd-10/sys/miscfs/procfs/procfs_vnops.c#L1352-L1356
+    set_errno(0);
+    // SAFETY: F_MAXFD ignores the descriptor argument and takes no pointer.
+    let highest = unsafe { libc::fcntl(0, libc::F_MAXFD) };
+    // An empty descriptor table also returns -1, without setting errno.
+    if highest == -1 && io::Error::last_os_error().raw_os_error() != Some(0) {
+        return Err(io::Error::last_os_error());
+    }
+    for fd in lowfd..=highest {
+        // SAFETY: this changes only the descriptor's close-on-exec flag.
+        match cerr(unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) }) {
+            // Gaps in the descriptor table are expected.
+            Err(err) if err.raw_os_error() == Some(libc::EBADF) => (),
+            result => {
+                result?;
+            }
+        }
+    }
+    Ok(())
+}
+
+#[cfg(not(target_os = "netbsd"))]
 fn mark_fds_as_cloexec_fallback(lowfd: i32) -> io::Result<()> {
     // If the kernel doesn't support close_range or CLOSE_RANGE_CLOEXEC,
     // fallback to finding all open fds using /proc/self/fd or /dev/fd
 
-    for entry in fs::read_dir(if cfg!(any(target_os = "linux", target_os = "netbsd")) {
+    for entry in std::fs::read_dir(if cfg!(target_os = "linux") {
         "/proc/self/fd"
     } else {
         "/dev/fd"
@@ -1228,6 +1256,96 @@ mod tests {
 
         let (_, status) = child_pid.wait(WaitOptions::new()).unwrap();
         assert_eq!(status.exit_status(), Some(0));
+    }
+
+    // FreeBSD uses close_range; its fallback reads /dev/fd, which lists only
+    // 0-2 unless fdescfs is mounted.
+    #[cfg(not(target_os = "freebsd"))]
+    #[test]
+    fn mark_fds_as_cloexec_fallback_ignores_lowered_limit() {
+        const CHILD: &str = "SUDO_RS_TEST_LOWERED_FD_LIMIT";
+        if std::env::var_os(CHILD).is_some() {
+            check_fallback_ignores_lowered_limit();
+        }
+
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "system::tests::mark_fds_as_cloexec_fallback_ignores_lowered_limit",
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .spawn()
+            .unwrap();
+        // The child's alarm only starts once it runs, so bound the wait here too.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        let status = loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                break status;
+            }
+            if std::time::Instant::now() > deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("the test process did not exit within 60 seconds");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        };
+        // Only a child that passed every check exits with 42; a test filter
+        // that matches nothing would exit 0.
+        assert_eq!(
+            status.code(),
+            Some(42),
+            "the test process failed, see above"
+        );
+    }
+
+    // This changes RLIMIT_NOFILE and opens 201 descriptors, so it runs in a fresh
+    // copy of the test binary, not in the test runner or a forked copy of it.
+    #[cfg(not(target_os = "freebsd"))]
+    fn check_fallback_ignores_lowered_limit() -> ! {
+        use crate::cutils::cerr;
+
+        unsafe { libc::alarm(10) };
+
+        // A caller can open many descriptors, some above the limit it then
+        // lowers RLIMIT_NOFILE to: lowering the limit closes nothing. NetBSD's
+        // procfs stops listing a directory of descriptors at that limit once
+        // the listing takes more than one getdents call.
+        //
+        // 200 descriptors fill more than one 4 KiB page of getdents records (128
+        // of 32 bytes each), and one more sits at 400. That needs a hard limit
+        // above 400, which the defaults on Linux, macOS and NetBSD all exceed;
+        // where it is lower the test fails rather than pass without checking.
+        let mut limit = unsafe { std::mem::zeroed::<libc::rlimit>() };
+        cerr(unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) }).unwrap();
+        assert!(
+            limit.rlim_max > 400,
+            "this test needs a hard RLIMIT_NOFILE above 400, not {}",
+            limit.rlim_max
+        );
+        limit.rlim_cur = 401;
+        cerr(unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &limit) }).unwrap();
+
+        let file = std::fs::File::open("/dev/null").unwrap();
+        // keep 3-9 free for the fallback's own descriptors
+        let mut fds: Vec<_> = (0..200)
+            .map(|_| cerr(unsafe { libc::fcntl(file.as_raw_fd(), libc::F_DUPFD, 10) }).unwrap())
+            .collect();
+        fds.push(cerr(unsafe { libc::fcntl(file.as_raw_fd(), libc::F_DUPFD, 400) }).unwrap());
+        limit.rlim_cur = 64;
+        cerr(unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &limit) }).unwrap();
+        assert!(
+            fds.iter()
+                .all(|&fd| unsafe { libc::fcntl(fd, libc::F_GETFD) } == 0)
+        );
+
+        super::mark_fds_as_cloexec_fallback(3).unwrap();
+
+        for fd in fds {
+            let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+            assert_eq!(flags, libc::FD_CLOEXEC, "fd {fd}");
+        }
+        super::_exit(42)
     }
 
     #[cfg(target_os = "linux")]
